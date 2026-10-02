@@ -1030,6 +1030,9 @@ impl CompactorEventHandler {
 
         Self::validate_destination_overwrite(spec, db_state)?;
         Self::validate_drain_watermark_advance(spec, tree)?;
+        if compaction.status() == CompactionStatus::Submitted {
+            self.validate_no_conflict_with_claimable(compaction)?;
+        }
 
         // Reject parallel L0 compactions within the same segment. Each
         // segment owns its own `last_compacted_l0_sst_view_id` watermark
@@ -1057,6 +1060,60 @@ impl CompactorEventHandler {
         self.scheduler
             .validate(&self.state().into(), spec)
             .map_err(|_e| SlateDBError::InvalidCompaction)
+    }
+
+    /// Rejects a `Submitted` tiered compaction that collides with a compaction
+    /// already promoted past `Submitted` (`Scheduled`, `Running` or
+    /// `Compacted`): the same destination SR id anywhere (SR ids are globally
+    /// unique), or a shared source in the same segment.
+    ///
+    /// [`CompactorState::add_compaction`] enforces destination uniqueness for
+    /// scheduler-proposed specs, but externally submitted specs
+    /// ([`Compactor::submit`], e.g. `Admin::submit_compaction`) are written
+    /// straight to `.compactions` and reach the coordinator through
+    /// `merge_remote_compactions`, bypassing it. Without this check such a spec
+    /// is promoted to `Scheduled` next to a running job with the same
+    /// destination; a worker then claims both and the executor's
+    /// one-job-per-destination assertion panics. A shared source is wasted
+    /// work at best: whichever job commits second fails validation.
+    ///
+    /// Other `Submitted` entries are not conflicts: promotion is sequential, so
+    /// the first of two colliding submissions is promoted and the second is
+    /// rejected against it.
+    fn validate_no_conflict_with_claimable(
+        &self,
+        compaction: &Compaction,
+    ) -> Result<(), SlateDBError> {
+        let spec = compaction.spec();
+        if spec.is_drain() {
+            return Ok(());
+        }
+        let sources: HashSet<&SourceId> = spec.sources().iter().collect();
+        let conflict = self
+            .state()
+            .compactions_with_status(&[
+                CompactionStatus::Scheduled,
+                CompactionStatus::Running,
+                CompactionStatus::Compacted,
+            ])
+            .filter(|c| c.id() != compaction.id())
+            .find(|c| {
+                let other = c.spec();
+                (spec.destination().is_some() && other.destination() == spec.destination())
+                    || (other.segment() == spec.segment()
+                        && other.sources().iter().any(|s| sources.contains(s)))
+            });
+        if let Some(other) = conflict {
+            warn!(
+                "rejected compaction: conflicts with active compaction [id={}, spec={}, active_id={}, active_spec={}]",
+                compaction.id(),
+                spec,
+                other.id(),
+                other.spec()
+            );
+            return Err(SlateDBError::InvalidCompaction);
+        }
+        Ok(())
     }
 
     /// Rejects a tiered compaction whose destination SR id already exists as a
@@ -5294,6 +5351,151 @@ mod tests {
         );
         assert_eq!(state.db_state().tree.l0.len(), 1);
         assert_eq!(state.db_state().tree.compacted[0].id, 1);
+    }
+
+    /// Externally submitted specs (`Compactor::submit`, as `Admin::submit_compaction`
+    /// uses) bypass `add_compaction`'s destination check. Promotion must reject
+    /// one that collides with a claimed job: the same destination, or a shared
+    /// source. Promoting it let a worker run two jobs for one destination and
+    /// tripped the executor's one-job-per-destination assertion.
+    #[rstest]
+    #[case::same_destination(vec![SourceId::SortedRun(0)], 0)]
+    #[case::shared_source(vec![SourceId::SortedRun(2), SourceId::SortedRun(1)], 1)]
+    #[tokio::test]
+    async fn test_maybe_validate_submitted_rejects_conflict_with_claimed(
+        #[case] external_sources: Vec<SourceId>,
+        #[case] external_destination: u32,
+    ) {
+        let options = Arc::new(CompactorOptions {
+            enable_trivial_move: false,
+            max_concurrent_compactions: 4,
+            ..compactor_options()
+        });
+        let mut fixture = CompactorEventHandlerTestFixture::new_with_clock(
+            Arc::new(DefaultSystemClock::new()),
+            options,
+        )
+        .await;
+        // the external submission lands in `.compactions` directly and is
+        // merged in on refresh, skipping `add_compaction`
+        let external_id = Compactor::submit(
+            CompactionSpec::new(external_sources, external_destination),
+            fixture.compactions_store.clone(),
+            Arc::new(DbRand::default()),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .expect("failed to submit compaction");
+        // a scheduler job merging SR 1 into SR 0, already claimed by a worker
+        // (its id is minted after the submission's: `.compactions` rejects
+        // new ids older than ones it holds)
+        let running_id = Ulid::new();
+        fixture
+            .handler
+            .state_mut()
+            .add_compaction(
+                Compaction::new(
+                    running_id,
+                    CompactionSpec::new(vec![SourceId::SortedRun(1), SourceId::SortedRun(0)], 0),
+                )
+                .with_status(CompactionStatus::Running)
+                .with_worker(Some(WorkerSpec::new("w".to_string(), u64::MAX / 2))),
+            )
+            .unwrap();
+        fixture.handler.state_writer.refresh().await.unwrap();
+        let core = &mut fixture
+            .handler
+            .state_writer
+            .state
+            .manifest_mut_for_test()
+            .value
+            .core;
+        Arc::make_mut(&mut core.tree).compacted = vec![
+            SortedRun::new(2, [bounded_sst_view(3, b"a", b"z")]),
+            SortedRun::new(1, [bounded_sst_view(2, b"a", b"z")]),
+            SortedRun::new(0, [bounded_sst_view(1, b"a", b"z")]),
+        ];
+
+        fixture
+            .handler
+            .maybe_validate_submitted_compactions()
+            .await
+            .unwrap();
+
+        let compactions = &fixture.handler.state().compactions().value;
+        assert_eq!(
+            compactions.get(&external_id).unwrap().status(),
+            CompactionStatus::Failed
+        );
+        assert_eq!(
+            compactions.get(&running_id).unwrap().status(),
+            CompactionStatus::Running
+        );
+    }
+
+    /// A non-conflicting external submission is still promoted, and of two
+    /// submissions sharing a destination only the first is promoted.
+    #[tokio::test]
+    async fn test_maybe_validate_submitted_promotes_first_of_colliding_submissions() {
+        let options = Arc::new(CompactorOptions {
+            enable_trivial_move: false,
+            max_concurrent_compactions: 4,
+            ..compactor_options()
+        });
+        let mut fixture = CompactorEventHandlerTestFixture::new_with_clock(
+            Arc::new(DefaultSystemClock::new()),
+            options,
+        )
+        .await;
+        let rand = Arc::new(DbRand::default());
+        let clock: Arc<dyn SystemClock> = Arc::new(DefaultSystemClock::new());
+        let mut ids = Vec::new();
+        for spec in [
+            CompactionSpec::new(vec![SourceId::SortedRun(2)], 2),
+            CompactionSpec::new(vec![SourceId::SortedRun(1)], 1),
+            CompactionSpec::new(vec![SourceId::SortedRun(1)], 1),
+        ] {
+            ids.push(
+                Compactor::submit(
+                    spec,
+                    fixture.compactions_store.clone(),
+                    rand.clone(),
+                    clock.clone(),
+                )
+                .await
+                .expect("failed to submit compaction"),
+            );
+        }
+        fixture.handler.state_writer.refresh().await.unwrap();
+        let core = &mut fixture
+            .handler
+            .state_writer
+            .state
+            .manifest_mut_for_test()
+            .value
+            .core;
+        Arc::make_mut(&mut core.tree).compacted = vec![
+            SortedRun::new(2, [bounded_sst_view(3, b"a", b"z")]),
+            SortedRun::new(1, [bounded_sst_view(2, b"a", b"z")]),
+            SortedRun::new(0, [bounded_sst_view(1, b"a", b"z")]),
+        ];
+
+        fixture
+            .handler
+            .maybe_validate_submitted_compactions()
+            .await
+            .unwrap();
+
+        let compactions = &fixture.handler.state().compactions().value;
+        let status = |id: &Ulid| compactions.get(id).unwrap().status();
+        assert_eq!(status(&ids[0]), CompactionStatus::Scheduled);
+        // exactly one of the two colliding submissions is promoted
+        let mut colliding = [status(&ids[1]), status(&ids[2])];
+        colliding.sort_by_key(|s| format!("{s:?}"));
+        assert_eq!(
+            colliding,
+            [CompactionStatus::Failed, CompactionStatus::Scheduled]
+        );
     }
 
     #[tokio::test]
