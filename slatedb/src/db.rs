@@ -12873,4 +12873,233 @@ mod tests {
             }
         }
     }
+
+    /// How a scan in [`test_scan_fast_paths_match_next`] reads its rows.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum ScanReadMode {
+        /// Every row from an awaited `next` down the iterator stack.
+        Reference,
+        /// `next`, through the sync fast path.
+        Next,
+        /// `next_batch` of random sizes, mixed with single `next`s.
+        Batch,
+    }
+
+    /// Reads a scan to its end, seeking (ascending scans) past the last
+    /// returned key after the planned numbers of rows. Returns the rows and
+    /// the seek outcomes, in order.
+    async fn read_scan(
+        iter: &mut DbIterator,
+        mode: ScanReadMode,
+        seeks: &[(usize, u32)],
+        rng: &mut TestRng,
+    ) -> Vec<Result<Option<KeyValue>, String>> {
+        use rand::Rng;
+        if mode == ScanReadMode::Reference {
+            iter.disable_sync_fast_path();
+        }
+        let mut out = Vec::new();
+        let mut rows = 0;
+        let mut last_num: Option<u32> = None;
+        let mut seeks = seeks.iter().peekable();
+        loop {
+            if let Some(&&(at, bump)) = seeks.peek() {
+                if at <= rows {
+                    seeks.next();
+                    let target = last_num.map_or(bump, |n| n + 1 + bump);
+                    let key = format!("k{target:03}");
+                    out.push(
+                        iter.seek(&key)
+                            .await
+                            .map(|()| None)
+                            .map_err(|e| e.to_string()),
+                    );
+                    continue;
+                }
+            }
+            let until_seek = seeks.peek().map_or(usize::MAX, |&&(at, _)| at - rows);
+            let got: Vec<KeyValue> = if mode == ScanReadMode::Batch && rng.random_bool(0.8) {
+                let n = rng.random_range(1..=48).min(until_seek);
+                iter.next_batch(n).await.unwrap()
+            } else {
+                iter.next().await.unwrap().into_iter().collect()
+            };
+            if got.is_empty() {
+                break;
+            }
+            rows += got.len();
+            for kv in got {
+                last_num = Some(std::str::from_utf8(&kv.key[1..]).unwrap().parse().unwrap());
+                out.push(Ok(Some(kv)));
+            }
+        }
+        out
+    }
+
+    /// The sync fast path of `DbIterator::next` and `next_batch` return what
+    /// awaited `next`s down the iterator stack do, over memtables, L0s and a
+    /// multi-SST sorted run, with versions, deletes, merge operands, TTLs,
+    /// snapshots, ranges, both orders, seeks and different read-ahead.
+    /// Compaction runs only on demand, so all three read the same layout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_scan_fast_paths_match_next() {
+        use rand::Rng;
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        for case in 0..10u32 {
+            let mut seed = [7u8; 32];
+            seed[..4].copy_from_slice(&case.to_le_bytes());
+            let mut rng = proptest_util::rng::new_test_rng(Some(seed));
+            let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let path = format!("/tmp/test_scan_fast_paths_{case}");
+            let should_compact = Arc::new(AtomicBool::new(false));
+            let should_compact_clone = should_compact.clone();
+            let scheduler = Arc::new(OnDemandCompactionSchedulerSupplier::new(Arc::new(
+                move |_state| should_compact_clone.swap(false, Ordering::SeqCst),
+            )));
+            let mut compactor_options = fast_compactor_options();
+            compactor_options.poll_interval = Duration::from_millis(5);
+            if let Some(worker) = compactor_options.worker.as_mut() {
+                worker.compactions_poll_interval = Duration::from_millis(5);
+                worker.max_sst_size = 4096;
+            }
+            let mut settings = test_db_options(0, 8192, None);
+            settings.l0_max_ssts = 10_000;
+            settings.l0_max_ssts_per_key = 10_000;
+            settings.manifest_poll_interval = Duration::from_millis(10);
+            let db = Db::builder(path.as_str(), object_store.clone())
+                .with_settings(settings)
+                .with_sst_block_size(SstBlockSize::Block1Kib)
+                .with_merge_operator(Arc::new(StringConcatMergeOperator))
+                .with_compactor_builder(
+                    CompactorBuilder::new(path.as_str(), object_store.clone())
+                        .with_scheduler_supplier(scheduler)
+                        .with_merge_operator(Arc::new(StringConcatMergeOperator))
+                        .with_options(compactor_options),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let mut snapshots = Vec::new();
+            let key_count = rng.random_range(8..250u32);
+            for op in 0..900u32 {
+                let key = format!("k{:03}", rng.random_range(0..key_count));
+                let mut value = vec![b'a' + (op % 26) as u8; rng.random_range(16..200)];
+                value.extend_from_slice(op.to_string().as_bytes());
+                let ttl = if rng.random_bool(0.2) {
+                    // real time: some expire before a compaction drops them
+                    Ttl::ExpireAfterMillis(rng.random_range(1..200))
+                } else {
+                    Ttl::Default
+                };
+                let write = WriteOptions::default();
+                // Always some L0s and memtable rows over a sorted run.
+                let roll = match op {
+                    450 => 999,
+                    800 => 998,
+                    _ => rng.random_range(0..1000),
+                };
+                match roll {
+                    0..=499 => {
+                        db.put_with_options(&key, &value, &PutOptions { ttl }, &write)
+                            .await
+                            .unwrap();
+                    }
+                    500..=649 => {
+                        db.delete_with_options(&key, &write).await.unwrap();
+                    }
+                    650..=899 => {
+                        db.merge_with_options(&key, &value[..8], &MergeOptions { ttl }, &write)
+                            .await
+                            .unwrap();
+                    }
+                    900..=939 | 998 => db
+                        .flush_with_options(FlushOptions {
+                            flush_type: FlushType::MemTable,
+                        })
+                        .await
+                        .unwrap(),
+                    940..=944 | 999 => {
+                        db.flush_with_options(FlushOptions {
+                            flush_type: FlushType::MemTable,
+                        })
+                        .await
+                        .unwrap();
+                        tokio::time::timeout(Duration::from_secs(30), async {
+                            // The compactor may propose from a manifest that
+                            // predates the flush: keep asking until L0 drains.
+                            while !db.inner.state.read().state().core().tree.l0.is_empty() {
+                                should_compact.store(true, Ordering::SeqCst);
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                            }
+                        })
+                        .await
+                        .expect("compaction did not drain L0");
+                    }
+                    945..=974 => snapshots.push(db.snapshot().unwrap()),
+                    _ => tokio::time::sleep(Duration::from_millis(5)).await,
+                }
+            }
+
+            for scan in 0..16 {
+                let bound = |rng: &mut TestRng| match rng.random_range(0..5) {
+                    0 | 1 => Unbounded,
+                    2 => Excluded(Bytes::from(format!(
+                        "k{:03}",
+                        rng.random_range(0..key_count)
+                    ))),
+                    _ => Included(Bytes::from(format!(
+                        "k{:03}",
+                        rng.random_range(0..key_count)
+                    ))),
+                };
+                let (lo, hi) = (bound(&mut rng), bound(&mut rng));
+                let Some(range) = BytesRange::try_new(lo, hi) else {
+                    continue;
+                };
+                let order = if rng.random_bool(0.7) {
+                    IterationOrder::Ascending
+                } else {
+                    IterationOrder::Descending
+                };
+                let options = ScanOptions {
+                    read_ahead_bytes: [1, 1024, 4096, 1 << 20][rng.random_range(0..4)],
+                    max_fetch_tasks: rng.random_range(1..=4),
+                    cache_blocks: rng.random_bool(0.5),
+                    ..ScanOptions::default()
+                }
+                .with_order(order);
+                let mut seeks = Vec::new();
+                if matches!(order, IterationOrder::Ascending) {
+                    let mut at = 0;
+                    for _ in 0..rng.random_range(0..4) {
+                        at += rng.random_range(0..30);
+                        seeks.push((at, rng.random_range(0..4)));
+                    }
+                }
+                let snapshot = (!snapshots.is_empty() && rng.random_bool(0.4))
+                    .then(|| snapshots[rng.random_range(0..snapshots.len())].clone());
+                let mut results = Vec::new();
+                for mode in [
+                    ScanReadMode::Reference,
+                    ScanReadMode::Next,
+                    ScanReadMode::Batch,
+                ] {
+                    let mut iter = match &snapshot {
+                        Some(snapshot) => snapshot.scan_with_options(range.clone(), &options).await,
+                        None => db.scan_with_options(range.clone(), &options).await,
+                    }
+                    .unwrap();
+                    results.push(read_scan(&mut iter, mode, &seeks, &mut rng).await);
+                }
+                let context = format!(
+                    "case {case} scan {scan}: range {range:?} order {order:?} seeks {seeks:?} snapshot {}",
+                    snapshot.is_some()
+                );
+                assert_eq!(results[1], results[0], "next: {context}");
+                assert_eq!(results[2], results[0], "next_batch: {context}");
+            }
+            db.close().await.unwrap();
+        }
+    }
 }

@@ -262,6 +262,26 @@ impl RowEntryIterator for SegmentMergeIterator {
         }
     }
 
+    fn try_next_sync(&mut self) -> Option<Result<Option<RowEntry>, SlateDBError>> {
+        if !self.initialized {
+            return None;
+        }
+        loop {
+            // A `Pending` child must be built (SST opens), which is left to `next`.
+            let child = match self.children.front_mut() {
+                None => return Some(Ok(None)),
+                Some((_, SegmentIterState::Pending(_))) => return None,
+                Some((_, SegmentIterState::Built(child))) => child,
+            };
+            match child.try_next_sync()? {
+                Ok(None) => {
+                    self.children.pop_front();
+                }
+                next => return Some(next),
+            }
+        }
+    }
+
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
         if !self.initialized {
             return Err(SlateDBError::IteratorNotInitialized);

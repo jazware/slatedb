@@ -226,13 +226,9 @@ impl<B: BlockLike> AscendingState<B> {
     }
 }
 
-#[async_trait]
-impl<B: BlockLike> RowEntryIterator for BlockIteratorV2<B> {
-    async fn init(&mut self) -> Result<(), SlateDBError> {
-        Ok(())
-    }
-
-    async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+impl<B: BlockLike> BlockIteratorV2<B> {
+    /// [`RowEntryIterator::next`], which never awaits.
+    pub(crate) fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
         match &mut self.inner {
             BlockIteratorInner::Ascending(state) => {
                 if state.is_empty() {
@@ -262,8 +258,23 @@ impl<B: BlockLike> RowEntryIterator for BlockIteratorV2<B> {
 
                 Ok(Some(entry))
             }
-            BlockIteratorInner::Descending(iter) => iter.next().await,
+            BlockIteratorInner::Descending(iter) => iter.next_entry(),
         }
+    }
+}
+
+#[async_trait]
+impl<B: BlockLike> RowEntryIterator for BlockIteratorV2<B> {
+    async fn init(&mut self) -> Result<(), SlateDBError> {
+        Ok(())
+    }
+
+    async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        self.next_entry()
+    }
+
+    fn try_next_sync(&mut self) -> Option<Result<Option<RowEntry>, SlateDBError>> {
+        Some(self.next_entry())
     }
 
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
@@ -390,9 +401,8 @@ impl<B: BlockLike> DescendingBlockIteratorV2<B> {
     }
 }
 
-#[async_trait]
-impl<B: BlockLike> RowEntryIterator for DescendingBlockIteratorV2<B> {
-    async fn init(&mut self) -> Result<(), SlateDBError> {
+impl<B: BlockLike> DescendingBlockIteratorV2<B> {
+    fn init_sync(&mut self) -> Result<(), SlateDBError> {
         if !self.initialized && !self.exhausted {
             self.load_restart_region(self.current_restart_idx as usize)?;
             self.initialized = true;
@@ -400,9 +410,10 @@ impl<B: BlockLike> RowEntryIterator for DescendingBlockIteratorV2<B> {
         Ok(())
     }
 
-    async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+    /// [`RowEntryIterator::next`], which never awaits.
+    fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
         if !self.initialized {
-            self.init().await?;
+            self.init_sync()?;
         }
 
         if self.exhausted {
@@ -425,6 +436,21 @@ impl<B: BlockLike> RowEntryIterator for DescendingBlockIteratorV2<B> {
         let entry = self.cached_entries[self.cache_idx as usize].clone();
         self.cache_idx -= 1;
         Ok(Some(entry))
+    }
+}
+
+#[async_trait]
+impl<B: BlockLike> RowEntryIterator for DescendingBlockIteratorV2<B> {
+    async fn init(&mut self) -> Result<(), SlateDBError> {
+        self.init_sync()
+    }
+
+    async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        self.next_entry()
+    }
+
+    fn try_next_sync(&mut self) -> Option<Result<Option<RowEntry>, SlateDBError>> {
+        Some(self.next_entry())
     }
 
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {

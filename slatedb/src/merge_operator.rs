@@ -224,6 +224,15 @@ impl<T: RowEntryIterator> RowEntryIterator for MergeOperatorRequiredIterator<T> 
         Ok(None)
     }
 
+    fn try_next_sync(&mut self) -> Option<Result<Option<RowEntry>, SlateDBError>> {
+        match self.delegate.try_next_sync()? {
+            Ok(Some(entry)) if matches!(entry.value, ValueDeletable::Merge(_)) => {
+                Some(Err(SlateDBError::MergeOperatorMissing))
+            }
+            next => Some(next),
+        }
+    }
+
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
         self.delegate.seek(next_key).await
     }
@@ -487,6 +496,28 @@ impl<T: RowEntryIterator> RowEntryIterator for MergeOperatorIterator<T> {
             }
         }
         Ok(None)
+    }
+
+    fn try_next_sync(&mut self) -> Option<Result<Option<RowEntry>, SlateDBError>> {
+        let next = match self.buffered_entry.take() {
+            Some(entry) => entry,
+            None => match self.delegate.try_next_sync()? {
+                Ok(Some(entry)) => entry,
+                other => return Some(other),
+            },
+        };
+        let needs_merge = match &next.value {
+            ValueDeletable::Merge(_) => self
+                .snapshot_barrier_seq
+                .is_none_or(|barrier| next.seq <= barrier),
+            _ => false,
+        };
+        if needs_merge {
+            // Merging reads ahead, which is left to `next`: hand it the entry.
+            self.buffered_entry = Some(next);
+            return None;
+        }
+        Some(Ok(Some(next)))
     }
 
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {

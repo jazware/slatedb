@@ -243,10 +243,17 @@ impl RowEntryIterator for ScanIterator {
         self.delegate.next().await
     }
 
+    fn try_next_sync(&mut self) -> Option<Result<Option<RowEntry>, SlateDBError>> {
+        self.delegate.try_next_sync()
+    }
+
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
         self.delegate.seek(next_key).await
     }
 }
+
+/// Rows [`DbIterator::next_batch`] allocates room for up front.
+const BATCH_PREALLOC_ROWS: usize = 1024;
 
 pub struct DbIterator {
     range: BytesRange,
@@ -255,6 +262,9 @@ pub struct DbIterator {
     last_key: Option<Bytes>,
     order: IterationOrder,
     read_span: tracing::Span,
+    /// Tests compare against the plain `next` path.
+    #[cfg(test)]
+    sync_fast_path: bool,
 }
 
 impl DbIterator {
@@ -331,7 +341,27 @@ impl DbIterator {
             last_key: None,
             order,
             read_span,
+            #[cfg(test)]
+            sync_fast_path: true,
         })
+    }
+
+    /// Makes every row come from an awaited `next` (the reference path).
+    #[cfg(test)]
+    pub(crate) fn disable_sync_fast_path(&mut self) {
+        self.sync_fast_path = false;
+    }
+
+    /// The next row from the iterator stack, without awaiting when it can.
+    async fn next_row(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        #[cfg(test)]
+        if !self.sync_fast_path {
+            return self.iter.next().await;
+        }
+        match self.iter.try_next_sync() {
+            Some(next) => next,
+            None => self.iter.next().await,
+        }
     }
 
     /// Get the next key-value pair.
@@ -365,7 +395,7 @@ impl DbIterator {
             Err(error)
         } else {
             let result = loop {
-                let next = self.iter.next().await;
+                let next = self.next_row().await;
                 // Keep cached iteration cooperative.
                 tokio::task::coop::consume_budget().await;
                 match next {
@@ -383,6 +413,58 @@ impl DbIterator {
             }
             result
         }
+    }
+
+    /// Gets up to `max_rows` key-value pairs: the pairs, in order, that as
+    /// many calls to [`Self::next`] would return. Fewer than `max_rows` means
+    /// the iterator is exhausted (an empty batch: it already was), or that the
+    /// next row failed: that error is returned by the following call (a batch
+    /// is only an error if it has no rows).
+    ///
+    /// Rows already in memory (memtables, fetched SST blocks) are produced
+    /// without awaiting, so this is much cheaper per row than [`Self::next`]
+    /// for scans; it awaits only to load blocks or open tables.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if the iterator has been invalidated due to an underlying error.
+    pub async fn next_batch(&mut self, max_rows: usize) -> Result<Vec<KeyValue>, crate::Error> {
+        let read_span = self.read_span.clone();
+        self.next_batch_inner(max_rows)
+            .instrument(read_span)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn next_batch_inner(&mut self, max_rows: usize) -> Result<Vec<KeyValue>, SlateDBError> {
+        if let Some(error) = self.invalidated_error.clone() {
+            return Err(error);
+        }
+        let mut out = Vec::with_capacity(max_rows.min(BATCH_PREALLOC_ROWS));
+        while out.len() < max_rows {
+            let next = self.next_row().await;
+            // Keep cached iteration cooperative, as `next` does.
+            tokio::task::coop::consume_budget().await;
+            match next {
+                Ok(Some(entry)) => {
+                    if !entry.value.is_tombstone() {
+                        out.push(KeyValue::from(entry));
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    self.invalidated_error = Some(e.clone());
+                    if out.is_empty() {
+                        return Err(e);
+                    }
+                    break;
+                }
+            }
+        }
+        if let Some(last) = out.last() {
+            self.last_key = Some(last.key.clone());
+        }
+        Ok(out)
     }
 
     fn maybe_invalidate<T: Clone>(

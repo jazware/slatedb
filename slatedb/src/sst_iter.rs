@@ -634,6 +634,59 @@ impl<'a> InternalSstIterator<'a> {
         Ok(())
     }
 
+    /// [`Self::advance_block`] without awaiting, for an initialized iterator
+    /// whose next block has already been fetched. Returns `None` (having
+    /// made no visible progress) when it would have to wait for a fetch.
+    fn try_advance_block_sync(&mut self) -> Option<Result<(), SlateDBError>> {
+        debug_assert!(self.state.is_initialized());
+        self.index.as_ref()?;
+        if self.state.is_finished() {
+            return Some(Ok(()));
+        }
+        let sst_version = self.view.table_as_ref().sst.format_version;
+        let sst_id = self.view.table_as_ref().sst.id;
+        loop {
+            self.spawn_fetches();
+            match self.fetch_tasks.front_mut() {
+                Some(FetchTask::InFlight(jh)) => {
+                    // A finished fetch is taken without yielding; one still
+                    // running (or an exhausted coop budget) is left to `next`.
+                    let blocks = match futures::FutureExt::now_or_never(&mut *jh)? {
+                        Ok(Ok(blocks)) => blocks,
+                        Ok(Err(e)) => return Some(Err(e)),
+                        Err(join_err) => {
+                            return Some(Err(block_fetch_join_error(join_err, sst_id)))
+                        }
+                    };
+                    *self.fetch_tasks.front_mut().expect("front exists") =
+                        FetchTask::Finished(blocks);
+                }
+                Some(FetchTask::Finished(blocks)) => {
+                    let block = match self.options.order {
+                        IterationOrder::Ascending => blocks.pop_front(),
+                        IterationOrder::Descending => blocks.pop_back(),
+                    };
+                    match block {
+                        Some(block) => {
+                            return Some(
+                                DataBlockIterator::new(block, sst_version, self.options.order)
+                                    .map(|iter| self.state.advance(iter)),
+                            );
+                        }
+                        None => {
+                            self.fetch_tasks.pop_front();
+                        }
+                    }
+                }
+                None => {
+                    // The whole range has been read (see `next_iter`).
+                    self.state.stop();
+                    return Some(Ok(()));
+                }
+            }
+        }
+    }
+
     fn stop(&mut self) {
         if let Some(index) = self.index.as_ref() {
             // For ascending order, stopping means we've gone to the end
@@ -790,6 +843,48 @@ impl RowEntryIterator for InternalSstIterator<'_> {
             }
         }
         Ok(None)
+    }
+
+    fn try_next_sync(&mut self) -> Option<Result<Option<RowEntry>, SlateDBError>> {
+        if !self.state.is_initialized() {
+            return None;
+        }
+        if let IterationOrder::Descending = self.options.order {
+            // Only buffered entries; refilling the buffer is left to `next`.
+            let buffer = self.descending_buffer.as_mut()?;
+            return buffer.pop_front().map(|entry| Ok(Some(entry)));
+        }
+
+        while !self.state.is_finished() {
+            let next = match self
+                .state
+                .current_iter
+                .as_mut()
+                .map(|iter| iter.next_entry())
+            {
+                Some(Ok(next)) => next,
+                Some(Err(e)) => return Some(Err(e)),
+                None => None,
+            };
+
+            match next {
+                Some(kv) => {
+                    if self.view.contains(&kv.key) {
+                        return Some(Ok(Some(kv)));
+                    } else if self.view.key_exceeds(&kv.key) {
+                        self.stop();
+                    }
+                }
+                // An exhausted block iterator keeps returning `None`, so
+                // falling back to `next` here is safe.
+                None => {
+                    if let Err(e) = self.try_advance_block_sync()? {
+                        return Some(Err(e));
+                    }
+                }
+            }
+        }
+        Some(Ok(None))
     }
 
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
@@ -952,6 +1047,21 @@ impl RowEntryIterator for FilterIterator<'_> {
         }
 
         Ok(next)
+    }
+
+    fn try_next_sync(&mut self) -> Option<Result<Option<RowEntry>, SlateDBError>> {
+        if self.is_filtered_out() {
+            self.filter.notify_finished_iteration();
+            return Some(Ok(None));
+        }
+
+        let next = self.inner.try_next_sync()?;
+        match &next {
+            Ok(Some(entry)) => self.filter.notify_key_found(entry.key.as_ref()),
+            Ok(None) => self.filter.notify_finished_iteration(),
+            Err(_) => {}
+        }
+        Some(next)
     }
 
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
@@ -1209,6 +1319,13 @@ impl RowEntryIterator for SstIterator<'_> {
         match &mut self.delegate {
             SstIteratorDelegate::Direct(inner) => inner.next().await,
             SstIteratorDelegate::Filter(inner) => inner.next().await,
+        }
+    }
+
+    fn try_next_sync(&mut self) -> Option<Result<Option<RowEntry>, SlateDBError>> {
+        match &mut self.delegate {
+            SstIteratorDelegate::Direct(inner) => inner.try_next_sync(),
+            SstIteratorDelegate::Filter(inner) => inner.try_next_sync(),
         }
     }
 

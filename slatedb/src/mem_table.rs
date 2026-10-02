@@ -209,6 +209,10 @@ impl RowEntryIterator for MemTableIterator {
         Ok(self.next_sync())
     }
 
+    fn try_next_sync(&mut self) -> Option<Result<Option<RowEntry>, SlateDBError>> {
+        Some(Ok(self.next_sync()))
+    }
+
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
         loop {
             let front = self.borrow_item().clone();

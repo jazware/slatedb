@@ -156,6 +156,27 @@ async fn collect(db: &Db, range: KeyRange, order: IterationOrder) -> Vec<(Bytes,
     got
 }
 
+/// [`collect`] through `next_batch`, `batch` rows at a time.
+async fn collect_batched(
+    db: &Db,
+    range: KeyRange,
+    order: IterationOrder,
+    batch: usize,
+) -> Vec<(Bytes, Bytes)> {
+    let options = ScanOptions::default().with_order(order);
+    let mut iter = db.scan_with_options(range, &options).await.unwrap();
+    let mut got = Vec::new();
+    loop {
+        let rows = iter.next_batch(batch).await.unwrap();
+        if rows.is_empty() {
+            break;
+        }
+        assert!(rows.len() <= batch);
+        got.extend(rows.into_iter().map(|kv| (kv.key, kv.value)));
+    }
+    got
+}
+
 /// Applies a generated write sequence to both a db and a `BTreeMap`, then
 /// checks that a scan of a generated range in a generated direction returns
 /// exactly what the model holds.
@@ -216,6 +237,13 @@ fn test_scan_matches_model() {
                                 expected,
                                 "scan mismatch for range {range:?} order {order:?}"
                             );
+                            for batch in [1, 3, 1024] {
+                                assert_eq!(
+                                    &collect_batched(&db, range.clone(), order, batch).await,
+                                    expected,
+                                    "next_batch({batch}) mismatch for range {range:?} order {order:?}"
+                                );
+                            }
                         }
                     }
                     db.close().await.unwrap();
