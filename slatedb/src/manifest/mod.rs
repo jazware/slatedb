@@ -1455,6 +1455,32 @@ impl Manifest {
         }
     }
 
+    /// A projection keeps each view's id, so two sources that
+    /// inherited the same ancestor L0 view (the two halves of a split, merged
+    /// back while both still hold the parent's L0s) carry it under one id,
+    /// each with its own visible range. The compactor keys L0 views by id
+    /// (`get_l0_sst_views` collects them into a map, `finish_drain_compaction`
+    /// retains by id): it compacted one of the two and dropped both, losing
+    /// the other range's keys. Every repeat gets a fresh id with the same
+    /// timestamp. The union starts with no L0 watermark
+    /// (`last_compacted_l0_sst_view_id`), so nothing refers to the old ids.
+    fn reassign_repeated_l0_view_ids(core: &mut ManifestCore, rand: &DbRand) {
+        use rand::RngCore;
+        let mut seen: HashSet<ulid::Ulid> = HashSet::new();
+        let trees = std::iter::once(&mut core.tree).chain(core.segments.iter_mut().map(|s| &mut s.tree));
+        for tree in trees {
+            for view in Arc::make_mut(tree).l0.iter_mut() {
+                while !seen.insert(view.id) {
+                    let random = {
+                        let mut rng = rand.rng();
+                        ((rng.next_u64() as u128) << 64) | rng.next_u64() as u128
+                    };
+                    view.id = ulid::Ulid::from_parts(view.id.timestamp_ms(), random);
+                }
+            }
+        }
+    }
+
     pub(crate) fn cloned_from_union(
         sources: Vec<CloneSource>,
         rand: Arc<DbRand>,
@@ -1483,6 +1509,7 @@ impl Manifest {
             Self::build_segmented_lsm_state(&mut core, segments);
         }
         Self::renumber_union_sorted_runs(&mut core);
+        Self::reassign_repeated_l0_view_ids(&mut core, &rand);
 
         for source in &sources {
             core.last_l0_seq = max(core.last_l0_seq, source.manifest.core.last_l0_seq);
