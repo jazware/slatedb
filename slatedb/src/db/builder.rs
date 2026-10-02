@@ -1498,6 +1498,8 @@ pub struct CompactionWorkerBuilder<P: Into<Path>> {
     block_transformer: Option<Arc<dyn BlockTransformer>>,
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
     sst_block_size: Option<SstBlockSize>,
+    db_cache: Option<DbCacheAndScope>,
+    block_cache_policy: BlockCachePolicy,
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
 }
@@ -1517,9 +1519,32 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
             block_transformer: None,
             filter_policies: default_filter_policies(),
             sst_block_size: None,
+            db_cache: None,
+            block_cache_policy: BlockCachePolicy::default(),
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: None,
         }
+    }
+
+    /// Inserts the worker's output SSTs into the cache of the [`Db`] it
+    /// compacts, per [`BlockCachePolicy::compaction_output_targets`] (by
+    /// default their index and filters), so the DB's first reads of a
+    /// freshly compacted SST don't each fetch its metadata from the object
+    /// store. Pass the same cache and `db_cache_id` as
+    /// [`DbBuilder::with_db_cache`]. The worker doesn't close the cache.
+    pub fn with_db_cache(mut self, db_cache: Arc<dyn DbCache>, db_cache_id: u64) -> Self {
+        self.db_cache = Some(DbCacheAndScope::new(
+            Arc::new(UnownedDbCache::new(db_cache)),
+            db_cache_id,
+        ));
+        self
+    }
+
+    /// Sets which components of the worker's output go into the cache set
+    /// by [`Self::with_db_cache`].
+    pub fn with_block_cache_policy(mut self, policy: BlockCachePolicy) -> Self {
+        self.block_cache_policy = policy;
+        self
     }
 
     pub fn with_options(mut self, options: CompactionWorkerOptions) -> Self {
@@ -1601,6 +1626,18 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
         let manifest_store = Arc::new(ManifestStore::new(&path, self.main_object_store.clone()));
         let compactions_store =
             Arc::new(CompactionsStore::new(&path, self.main_object_store.clone()));
+        let recorder = MetricsRecorderHelper::new(
+            self.metrics_recorder,
+            self.options.metric_level.unwrap_or_default(),
+        );
+        let db_cache = self.db_cache.as_ref().map(|db_cache| {
+            Arc::new(DbCacheWrapper::new(
+                db_cache.cache.clone(),
+                &recorder,
+                self.system_clock.clone(),
+                db_cache.db_cache_id,
+            )) as Arc<dyn DbCache>
+        });
         let table_store = Arc::new(TableStore::new(
             self.main_object_store,
             SsTableFormat {
@@ -1612,14 +1649,10 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
                 ..SsTableFormat::default()
             },
             path,
-            None,
+            db_cache,
             TableStoreKind::Compactor,
-            BlockCachePolicy::default(),
+            self.block_cache_policy,
         ));
-        let recorder = MetricsRecorderHelper::new(
-            self.metrics_recorder,
-            self.options.metric_level.unwrap_or_default(),
-        );
         let stats = Arc::new(CompactionStats::new(&recorder));
         let worker_runtime = self.worker_runtime.unwrap_or_else(Handle::current);
         let options = Arc::new(self.options);

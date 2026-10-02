@@ -1934,6 +1934,89 @@ mod tests {
         db.close().await.unwrap();
     }
 
+    /// A standalone worker given the DB's cache and scope seeds its output's
+    /// index and filters there, so the DB's first reads of the new SST hit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_standalone_worker_caches_output_in_db_cache() {
+        let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = Arc::new(TestCache::new());
+        let mut options = db_options(None);
+        options.flush_interval = None;
+        options.min_filter_keys = 1;
+        let db = Db::builder(PATH, os.clone())
+            .with_settings(options)
+            .with_db_cache(cache.clone(), 7)
+            .build()
+            .await
+            .unwrap();
+        let compactor = CompactorBuilder::new(PATH, os.clone())
+            .with_options(CompactorOptions {
+                worker: None,
+                scheduler_options: SizeTieredCompactionSchedulerOptions {
+                    min_compaction_sources: 1,
+                    ..Default::default()
+                }
+                .into(),
+                ..compactor_options()
+            })
+            .build();
+        let worker = crate::db::builder::CompactionWorkerBuilder::new(PATH, os.clone())
+            .with_options(CompactionWorkerOptions {
+                compactions_poll_interval: Duration::from_millis(100),
+                min_filter_keys: 1,
+                ..CompactionWorkerOptions::default()
+            })
+            .with_db_cache(cache.clone(), 7)
+            .build()
+            .await
+            .unwrap();
+        let (compactor, worker) = (Arc::new(compactor), Arc::new(worker));
+        let (c, w) = (compactor.clone(), worker.clone());
+        tokio::spawn(async move { c.run().await });
+        tokio::spawn(async move { w.run().await });
+
+        let mut batch = WriteBatch::new();
+        for key in [b"a", b"b", b"c", b"d"] {
+            batch.put(key, b"value");
+        }
+        db.write_with_options(batch, &WriteOptions::default())
+            .await
+            .unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let view = loop {
+            db.refresh_manifest().await.unwrap();
+            let m = db.manifest();
+            if let Some(v) = m.compacted().iter().flat_map(|sr| sr.sst_views().iter()).next() {
+                break v.clone();
+            }
+            assert!(std::time::Instant::now() < deadline, "never compacted");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let mut cached: Vec<(u64, u64)> = cache
+            .keys()
+            .iter()
+            .filter(|k| k.sst_id == view.sst.id)
+            .map(|k| (k.db_cache_id, k.block_id))
+            .collect();
+        cached.sort();
+        let mut expected = vec![
+            (7, view.sst.info.index_offset),
+            (7, view.sst.info.filter_offset),
+        ];
+        expected.sort();
+        assert_eq!(cached, expected);
+
+        compactor.stop().await.unwrap();
+        worker.stop().await.unwrap();
+        db.close().await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_compactor_compacts_only_target_segment() {
         let os = Arc::new(InMemory::new());
