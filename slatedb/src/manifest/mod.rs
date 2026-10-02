@@ -1467,7 +1467,8 @@ impl Manifest {
     fn reassign_repeated_l0_view_ids(core: &mut ManifestCore, rand: &DbRand) {
         use rand::RngCore;
         let mut seen: HashSet<ulid::Ulid> = HashSet::new();
-        let trees = std::iter::once(&mut core.tree).chain(core.segments.iter_mut().map(|s| &mut s.tree));
+        let trees =
+            std::iter::once(&mut core.tree).chain(core.segments.iter_mut().map(|s| &mut s.tree));
         for tree in trees {
             for view in Arc::make_mut(tree).l0.iter_mut() {
                 while !seen.insert(view.id) {
@@ -3245,7 +3246,27 @@ mod tests {
         let sst_aliases: HashMap<SsTableId, String> =
             sst_ids.iter().map(|(k, v)| (*v, k.clone())).collect();
 
-        if actual.core.tree.l0 != expected.core.tree.l0 {
+        // A union's L0 views are compared by SST and visible range: view ids
+        // repeated across sources are reassigned (reassign_repeated_l0_view_ids),
+        // so they can't match the inputs. They must be unique within the union.
+        let mut view_ids = HashSet::new();
+        for view in actual.core.tree.l0.iter() {
+            assert!(
+                view_ids.insert(view.id),
+                "union repeats L0 view id {}",
+                view.id
+            );
+        }
+        let shape = |m: &Manifest| -> Vec<(SsTableHandle, Option<BytesRange>)> {
+            m.core
+                .tree
+                .l0
+                .iter()
+                .map(|v| (v.sst.clone(), v.visible_range.clone()))
+                .collect()
+        };
+
+        if shape(actual) != shape(expected) {
             let mut error_msg = String::from("Manifest L0 mismatch.\n\nActual: \n");
 
             // Format actual L0 entries
@@ -3269,11 +3290,14 @@ mod tests {
                     .map(format_range)
                     .unwrap_or_else(|| "None".to_string());
 
-                let result = if expected.core.tree.l0.get(idx) == Some(handle) {
-                    ""
-                } else {
-                    " --> Unexpected"
-                };
+                let result =
+                    if expected.core.tree.l0.get(idx).is_some_and(|e| {
+                        e.sst == handle.sst && e.visible_range == handle.visible_range
+                    }) {
+                        ""
+                    } else {
+                        " --> Unexpected"
+                    };
 
                 error_msg.push_str(&format!(
                     "{}. {} (first_entry: {}, visible_range: {}){}\n",
