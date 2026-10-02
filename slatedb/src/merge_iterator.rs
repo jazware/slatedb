@@ -84,6 +84,11 @@ pub(crate) struct MergeIterator<'a> {
     bytes_processed: u64,
     /// The iteration order for key comparison in the merge heap.
     order: IterationOrder,
+    /// A key's newest entry, taken by [`RowEntryIterator::try_next_sync`]
+    /// but not yet returned: its older versions (dedup) couldn't all be
+    /// skipped without awaiting. The next `next` skips the rest and returns
+    /// it, so errors surface exactly where `next` alone would raise them.
+    pending: Option<RowEntry>,
 }
 
 impl<'a> MergeIterator<'a> {
@@ -111,6 +116,7 @@ impl<'a> MergeIterator<'a> {
             dedup: true,
             initialized: false,
             bytes_processed: 0,
+            pending: None,
         })
     }
 
@@ -169,6 +175,54 @@ impl<'a> MergeIterator<'a> {
         }
         Ok(None)
     }
+
+    /// [`Self::advance`] without awaiting. `None` (no progress) when the
+    /// current entry's iterator can't produce its next entry synchronously.
+    fn try_advance_sync(&mut self) -> Option<Result<Option<RowEntry>, SlateDBError>> {
+        let iterator_state = self.current.as_mut()?;
+        let next = match iterator_state.iterator.try_next_sync()? {
+            Ok(next) => next,
+            Err(e) => {
+                // as in `advance`, which has taken `current` when it fails
+                self.current = None;
+                return Some(Err(e));
+            }
+        };
+        let mut iterator_state = self.current.take().expect("current checked above");
+        let current_kv = match next {
+            Some(kv) => {
+                let current_kv = std::mem::replace(&mut iterator_state.next_kv, kv);
+                self.iterators.push(Reverse(iterator_state));
+                current_kv
+            }
+            None => iterator_state.next_kv,
+        };
+        self.current = self.iterators.pop().map(|r| r.0);
+
+        // Track bytes processed for progress reporting
+        let entry_bytes = current_kv.key.len() as u64 + current_kv.value.len() as u64;
+        self.bytes_processed += entry_bytes;
+
+        Some(Ok(Some(current_kv)))
+    }
+
+    /// Skips the versions of `kv`'s key older than `kv` (dedup) without
+    /// awaiting. `None` when it has to await: `kv` is then left `pending`.
+    fn try_skip_older_sync(&mut self, kv: RowEntry) -> Option<Result<RowEntry, SlateDBError>> {
+        if !matches!(kv.value, ValueDeletable::Merge(_)) {
+            while self.peek().is_some_and(|entry| entry.key == kv.key) {
+                match self.try_advance_sync() {
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => return Some(Err(e)),
+                    None => {
+                        self.pending = Some(kv);
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(Ok(kv))
+    }
 }
 
 #[async_trait]
@@ -181,13 +235,17 @@ impl RowEntryIterator for MergeIterator<'_> {
         if !self.initialized {
             return Err(SlateDBError::IteratorNotInitialized);
         }
-        if !self.dedup {
-            return self.advance().await;
-        }
-
-        let current_kv = match self.advance().await? {
+        let current_kv = match self.pending.take() {
             Some(kv) => kv,
-            None => return Ok(None),
+            None => {
+                if !self.dedup {
+                    return self.advance().await;
+                }
+                match self.advance().await? {
+                    Some(kv) => kv,
+                    None => return Ok(None),
+                }
+            }
         };
 
         // the iterators are stored in order of increasing key and decreasing
@@ -208,9 +266,39 @@ impl RowEntryIterator for MergeIterator<'_> {
         Ok(Some(current_kv))
     }
 
+    fn try_next_sync(&mut self) -> Option<Result<Option<RowEntry>, SlateDBError>> {
+        if !self.initialized {
+            return None;
+        }
+        let current_kv = match self.pending.take() {
+            Some(kv) => kv,
+            None => {
+                if !self.dedup {
+                    return self.try_advance_sync();
+                }
+                match self.try_advance_sync()? {
+                    Ok(Some(kv)) => kv,
+                    other => return Some(other),
+                }
+            }
+        };
+        // dedup as in `next`
+        Some(self.try_skip_older_sync(current_kv)?.map(Some))
+    }
+
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
         if !self.initialized {
             return Err(SlateDBError::IteratorNotInitialized);
+        }
+        // A pending entry at or past `next_key` is still the next one (its
+        // older versions, also past it, are skipped by `next`); one before
+        // it is passed over, as are its older versions.
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|kv| kv.key.as_ref() < next_key)
+        {
+            self.pending = None;
         }
         self.ensure_initialized().await?;
         let mut seek_futures = VecDeque::new();

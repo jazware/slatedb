@@ -463,6 +463,10 @@ impl RowEntryIterator for WriteBatchIterator {
         Ok(self.iter.next())
     }
 
+    fn try_next_sync(&mut self) -> Option<Result<Option<RowEntry>, SlateDBError>> {
+        Some(Ok(self.iter.next()))
+    }
+
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
         while let Some(entry) = self.iter.peek() {
             if match self.ordering {

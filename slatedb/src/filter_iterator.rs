@@ -47,6 +47,17 @@ impl<T: RowEntryIterator> RowEntryIterator for FilterIterator<T> {
         Ok(None)
     }
 
+    fn try_next_sync(&mut self) -> Option<Result<Option<RowEntry>, SlateDBError>> {
+        // Filtered-out entries are consumed as they are passed over, as in
+        // `next`, so a fallback resumes after them.
+        loop {
+            match self.iterator.try_next_sync()? {
+                Ok(Some(entry)) if !(self.predicate)(&entry) => continue,
+                next => return Some(next),
+            }
+        }
+    }
+
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
         self.iterator.seek(next_key).await
     }

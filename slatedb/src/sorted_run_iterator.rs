@@ -406,6 +406,29 @@ impl RowEntryIterator for SortedRunIterator<'_> {
         }
     }
 
+    fn try_next_sync(&mut self) -> Option<Result<Option<RowEntry>, SlateDBError>> {
+        if !self.initialized {
+            return None;
+        }
+        match self.sst_iter_options.order {
+            IterationOrder::Ascending => match self.current_iter.as_mut() {
+                // An exhausted table needs the next one opened, which is
+                // left to `next` (the exhausted table keeps returning `None`).
+                Some(iter) => match iter.try_next_sync()? {
+                    Ok(None) => None,
+                    next => Some(next),
+                },
+                None => Some(Ok(None)),
+            },
+            // Only the current key's buffered entries.
+            IterationOrder::Descending => self
+                .descending_state()
+                .current_key_entries
+                .pop_front()
+                .map(|entry| Ok(Some(entry))),
+        }
+    }
+
     /// Ascending only. Descending scans reject `seek` at the API boundary, in
     /// [`crate::db_iter::DbIterator::seek`], so this is never reached with a
     /// descending order.

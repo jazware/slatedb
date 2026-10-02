@@ -77,9 +77,14 @@ impl<B: BlockLike> DataBlockIterator<B> {
     }
 
     pub(crate) async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        self.next_entry()
+    }
+
+    /// [`Self::next`], which never awaits.
+    pub(crate) fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
         match self {
-            Self::V1(iter) => iter.next().await,
-            Self::V2(iter) => iter.next().await,
+            Self::V1(iter) => iter.next_entry(),
+            Self::V2(iter) => iter.next_entry(),
         }
     }
 
@@ -109,13 +114,9 @@ pub(crate) struct BlockIterator<B: BlockLike> {
     ordering: IterationOrder,
 }
 
-#[async_trait]
-impl<B: BlockLike> RowEntryIterator for BlockIterator<B> {
-    async fn init(&mut self) -> Result<(), SlateDBError> {
-        Ok(())
-    }
-
-    async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+impl<B: BlockLike> BlockIterator<B> {
+    /// [`RowEntryIterator::next`], which never awaits.
+    pub(crate) fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
         let result = self.load_at_current_off();
         match result {
             Ok(None) => Ok(None),
@@ -125,6 +126,21 @@ impl<B: BlockLike> RowEntryIterator for BlockIterator<B> {
             }
             Err(e) => Err(e),
         }
+    }
+}
+
+#[async_trait]
+impl<B: BlockLike> RowEntryIterator for BlockIterator<B> {
+    async fn init(&mut self) -> Result<(), SlateDBError> {
+        Ok(())
+    }
+
+    async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        self.next_entry()
+    }
+
+    fn try_next_sync(&mut self) -> Option<Result<Option<RowEntry>, SlateDBError>> {
+        Some(self.next_entry())
     }
 
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
