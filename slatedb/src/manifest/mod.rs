@@ -108,20 +108,16 @@ impl LsmTreeState {
                     .l0
                     .iter()
                     .cloned()
-                    .take_while(|view| {
-                        // Match by view ID first (V2 manifests), then fall back
-                        // to SST ID (V1).
-                        if let Some(id) = last_compacted_view {
-                            if view.id == id {
-                                return false;
-                            }
-                        }
-                        if let Some(id) = last_compacted_sst {
-                            if view.sst.id.value() == id {
-                                return false;
-                            }
-                        }
-                        true
+                    .take_while(|view| match (last_compacted_view, last_compacted_sst) {
+                        // The SST ID is only a fallback for a marker without a
+                        // view ID (V1). One SST can back several L0 views (a
+                        // union of projections of one source, or of split
+                        // halves that share an ancestor's L0s), so an SST
+                        // match can land on a newer, uncompacted view and drop
+                        // it and every view after it.
+                        (Some(id), _) => view.id != id,
+                        (None, Some(id)) => view.sst.id.value() != id,
+                        (None, None) => true,
                     })
                     .collect()
             } else {
@@ -2243,6 +2239,38 @@ mod tests {
             let merged_via_writer_side = compactor.merge_from_writer(&writer);
             assert_eq!(merged, merged_via_writer_side);
         });
+    }
+
+    #[test]
+    fn test_lsm_tree_merge_cuts_at_view_id_when_an_sst_backs_several_views() {
+        fn view(view_ts: u64, sst_ts: u64) -> SsTableView {
+            SsTableView::new(
+                Ulid::from_parts(view_ts, 0),
+                SsTableHandle::new(
+                    SsTableId::from(Ulid::from_parts(sst_ts, 1)),
+                    SST_FORMAT_VERSION_LATEST,
+                    SsTableInfo::default(),
+                ),
+            )
+        }
+        // Two projections of SSTs 2 and 1, as a union of one source's key
+        // ranges has them: views 4 and 3 are one, views 2 and 1 the other.
+        // The compactor took the second (the L0 suffix) and holds both
+        // markers in memory, as `finish_compaction` sets them.
+        let writer = LsmTreeState {
+            l0: VecDeque::from([view(5, 5), view(4, 2), view(3, 1), view(2, 2), view(1, 1)]),
+            ..LsmTreeState::default()
+        };
+        let compactor = LsmTreeState {
+            last_compacted_l0_sst_view_id: Some(Ulid::from_parts(2, 0)),
+            last_compacted_l0_sst_id: Some(Ulid::from_parts(2, 1)),
+            l0: VecDeque::from([view(4, 2), view(3, 1)]),
+            compacted: vec![SortedRun::new(0, [view(6, 6)])],
+        };
+        let expected: Vec<_> = writer.l0.iter().take(3).cloned().collect();
+        let merged = writer.merge_from_compactor(&compactor);
+        assert_eq!(merged.l0.iter().cloned().collect::<Vec<_>>(), expected);
+        assert_eq!(compactor.merge_from_writer(&writer), merged);
     }
 
     #[test]
