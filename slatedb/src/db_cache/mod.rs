@@ -221,6 +221,37 @@ pub trait DbCache: Send + Sync {
         Ok(())
     }
 
+    /// Look up a data-block entry without loading it.
+    ///
+    /// The read path calls this before [`Self::fetch_block`], so a hit does not
+    /// build a loader. On a miss it calls `fetch_block`, which loads the entry
+    /// and deduplicates concurrent loads. The wrapper counts a hit here and
+    /// leaves a miss uncounted, because the `fetch_block` that follows counts it.
+    ///
+    /// The default calls [`Self::get_block`]. A cache whose `get_*` can do I/O
+    /// (for example a disk tier) should override this to check memory only, so
+    /// that a miss does not do that I/O twice. Return `Ok(None)` to always take
+    /// the fetch path. This contract also applies to [`Self::peek_index`],
+    /// [`Self::peek_filter`], and [`Self::peek_stats`].
+    async fn peek_block(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        self.get_block(key).await
+    }
+
+    /// Look up an index entry without loading it. See [`Self::peek_block`].
+    async fn peek_index(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        self.get_index(key).await
+    }
+
+    /// Look up a filter entry without loading it. See [`Self::peek_block`].
+    async fn peek_filter(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        self.get_filter(key).await
+    }
+
+    /// Look up a stats entry without loading it. See [`Self::peek_block`].
+    async fn peek_stats(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        self.get_stats(key).await
+    }
+
     /// Fetch a data-block entry, invoking `loader` on cache miss.
     ///
     /// Custom implementations must report the lookup result in [`CacheFetch::lookup`].
@@ -671,6 +702,38 @@ impl DbCache for SplitCache {
         block_result.and(meta_result)
     }
 
+    async fn peek_block(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        if let Some(cache) = &self.block_cache {
+            cache.peek_block(key).await
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn peek_index(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        if let Some(cache) = &self.meta_cache {
+            cache.peek_index(key).await
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn peek_filter(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        if let Some(cache) = &self.meta_cache {
+            cache.peek_filter(key).await
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn peek_stats(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        if let Some(cache) = &self.meta_cache {
+            cache.peek_stats(key).await
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn fetch_block(
         &self,
         key: CachedKey,
@@ -784,6 +847,14 @@ impl DbCacheWrapper {
                 ..
             }) => self.record_hit(block_type),
             Err(err) => self.record_get_err(block_type, err),
+        }
+    }
+
+    /// A peek counts only its hits. A miss or an error is counted by the
+    /// `fetch_*` that the read path calls next.
+    fn record_peek_hit(&self, block_type: &str, entry: &Result<Option<CachedEntry>, crate::Error>) {
+        if let Ok(Some(_)) = entry {
+            self.record_hit(block_type);
         }
     }
 
@@ -930,6 +1001,30 @@ impl DbCache for DbCacheWrapper {
         self.cache.flush_scope(self.db_cache_id).await
     }
 
+    async fn peek_block(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        let entry = self.cache.peek_block(&self.scoped_key(key)).await;
+        self.record_peek_hit("block", &entry);
+        entry
+    }
+
+    async fn peek_index(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        let entry = self.cache.peek_index(&self.scoped_key(key)).await;
+        self.record_peek_hit("index", &entry);
+        entry
+    }
+
+    async fn peek_filter(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        let entry = self.cache.peek_filter(&self.scoped_key(key)).await;
+        self.record_peek_hit("filter", &entry);
+        entry
+    }
+
+    async fn peek_stats(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        let entry = self.cache.peek_stats(&self.scoped_key(key)).await;
+        self.record_peek_hit("stats", &entry);
+        entry
+    }
+
     async fn fetch_block(
         &self,
         key: CachedKey,
@@ -1036,6 +1131,22 @@ impl DbCache for UnownedDbCache {
 
     async fn flush_to_disk(&self) -> Result<(), crate::Error> {
         self.inner.flush_to_disk().await
+    }
+
+    async fn peek_block(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        self.inner.peek_block(key).await
+    }
+
+    async fn peek_index(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        self.inner.peek_index(key).await
+    }
+
+    async fn peek_filter(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        self.inner.peek_filter(key).await
+    }
+
+    async fn peek_stats(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        self.inner.peek_stats(key).await
     }
 
     async fn fetch_block(
@@ -1847,6 +1958,54 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[tokio::test]
+    async fn test_peek_counts_hits_only(cache: (DbCacheWrapper, Arc<DefaultMetricsRecorder>)) {
+        let (cache, registry) = cache;
+        let count = |kind: &str, result: &str| {
+            lookup_metric_with_labels(
+                &registry,
+                super::stats::ACCESS_COUNT,
+                &[("entry_kind", kind), ("result", result)],
+            )
+        };
+        let key = CachedKey::from((SST_ID, 12345u64));
+        let mut builder = BlockBuilder::new_latest(4096);
+        assert!(builder.add(RowEntry::new_value(b"k", b"v", 0)).unwrap());
+        let block = CachedEntry::with_block(Arc::new(builder.build().unwrap()));
+
+        // A miss is left to the fetch that follows it.
+        assert!(cache.peek_block(&key).await.unwrap().is_none());
+        assert!(cache.peek_index(&key).await.unwrap().is_none());
+        assert!(cache.peek_filter(&key).await.unwrap().is_none());
+        assert!(cache.peek_stats(&key).await.unwrap().is_none());
+        for kind in ["data_block", "index", "filter", "stats"] {
+            assert_eq!(count(kind, "miss"), Some(0), "{kind}");
+            assert_eq!(count(kind, "hit"), Some(0), "{kind}");
+        }
+
+        cache.insert(key.clone(), block).await;
+        assert!(cache.peek_block(&key).await.unwrap().is_some());
+        assert!(cache.peek_block(&key).await.unwrap().is_some());
+        assert_eq!(count("data_block", "hit"), Some(2));
+        assert_eq!(count("data_block", "miss"), Some(0));
+
+        // A peek's error is left to the fetch too.
+        let recorder = Arc::new(DefaultMetricsRecorder::new());
+        let helper = MetricsRecorderHelper::new(recorder.clone(), MetricLevel::default());
+        let failing = DbCacheWrapper::new(
+            Arc::new(super::test_utils::FailingCache),
+            &helper,
+            Arc::new(DefaultSystemClock::default()),
+            1,
+        );
+        assert!(failing.peek_filter(&key).await.is_err());
+        assert_eq!(
+            slatedb_common::metrics::lookup_metric(&recorder, super::stats::ERROR_COUNT),
+            Some(0)
+        );
+    }
+
     #[tokio::test]
     async fn test_should_count_get_errors() {
         // given: a cache that always returns errors
@@ -2150,6 +2309,21 @@ mod tests {
                 self.flush_to_disk_called.store(true, Ordering::SeqCst);
                 Ok(())
             }
+            async fn peek_block(&self, _: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+                Ok(Some(self.marker.clone()))
+            }
+            async fn peek_index(&self, _: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+                Ok(Some(self.marker.clone()))
+            }
+            async fn peek_filter(
+                &self,
+                _: &CachedKey,
+            ) -> Result<Option<CachedEntry>, crate::Error> {
+                Ok(Some(self.marker.clone()))
+            }
+            async fn peek_stats(&self, _: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+                Ok(Some(self.marker.clone()))
+            }
             async fn fetch_block(
                 &self,
                 _: CachedKey,
@@ -2205,6 +2379,26 @@ mod tests {
                 Arc::ptr_eq(&entry.entry.block().unwrap(), &marker_block),
                 "fetch was not forwarded to the inner cache's override"
             );
+        }
+
+        // The defaults would call ProbeCache's get_*, which miss.
+        let split = SplitCache::new()
+            .with_block_cache(Some(probe.clone()))
+            .with_meta_cache(Some(probe.clone()))
+            .build();
+        for cache in [&unowned as &dyn DbCache, &split] {
+            let peeked = [
+                cache.peek_block(&key()).await.unwrap(),
+                cache.peek_index(&key()).await.unwrap(),
+                cache.peek_filter(&key()).await.unwrap(),
+                cache.peek_stats(&key()).await.unwrap(),
+            ];
+            for entry in peeked {
+                assert!(
+                    Arc::ptr_eq(&entry.unwrap().block().unwrap(), &marker_block),
+                    "peek was not forwarded to the inner cache's override"
+                );
+            }
         }
 
         unowned.close().await.unwrap();

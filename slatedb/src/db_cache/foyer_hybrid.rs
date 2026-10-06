@@ -92,6 +92,10 @@ impl FoyerHybridCache {
 }
 
 impl FoyerHybridCache {
+    fn peek_memory(&self, key: &CachedKey) -> Option<CachedEntry> {
+        self.inner.memory().get(key).map(|v| v.value().clone())
+    }
+
     async fn get(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
         self.inner
             .get(key)
@@ -117,6 +121,24 @@ impl DbCache for FoyerHybridCache {
 
     async fn get_stats(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
         self.get(key).await
+    }
+
+    // Memory only: `get` reads the disk tier on a memory miss, and the
+    // `fetch_*` that follows a missed peek reads it again.
+    async fn peek_block(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        Ok(self.peek_memory(key))
+    }
+
+    async fn peek_index(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        Ok(self.peek_memory(key))
+    }
+
+    async fn peek_filter(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        Ok(self.peek_memory(key))
+    }
+
+    async fn peek_stats(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        Ok(self.peek_memory(key))
     }
 
     async fn insert(&self, key: CachedKey, value: CachedEntry) {
@@ -309,6 +331,26 @@ mod tests {
         let third = cache.fetch_block(key, loader()).await.unwrap();
         assert_eq!(third.lookup, CacheLookup::Hit);
         assert_eq!(third.entry.size(), first.entry.size());
+        cache.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn peek_reads_memory_only() {
+        let (cache, _tempdir) = setup().await;
+        let key = CachedKey::from((SsTableId::new(Ulid::new()), 0));
+        cache.insert(key.clone(), build_block()).await;
+        assert!(cache.peek_block(&key).await.unwrap().is_some());
+        assert!(cache.peek_filter(&key).await.unwrap().is_some());
+
+        cache.flush_scope(0).await.unwrap();
+        assert!(cache.inner.memory().get(&key).is_none());
+        assert!(cache.peek_block(&key).await.unwrap().is_none());
+        assert!(cache.peek_index(&key).await.unwrap().is_none());
+        assert!(cache.peek_filter(&key).await.unwrap().is_none());
+        assert!(cache.peek_stats(&key).await.unwrap().is_none());
+        // Still on disk for the fetch that follows a missed peek.
+        assert!(cache.inner.memory().get(&key).is_none());
+        assert!(cache.get_block(&key).await.unwrap().is_some());
         cache.close().await.unwrap();
     }
 
