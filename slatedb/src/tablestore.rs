@@ -424,20 +424,25 @@ impl TableStore {
     ) -> Result<Arc<[NamedFilter]>, SlateDBError> {
         let cache_key: CachedKey = (handle.id, handle.info.filter_offset).into();
         if let Some(cache) = self.cache_for_reads() {
-            // cache_blocks=true: dedup-aware fetch; concurrent callers collapse onto
-            // one loader. cache_blocks=false: read-only lookup that won't pollute the
-            // cache on miss. Cache errors fall through to a best-effort direct load;
+            // cache_blocks=true: a peek, and on a miss a dedup-aware fetch where
+            // concurrent callers collapse onto one loader. A hit does not build
+            // the loader (see `read_loader`). cache_blocks=false: read-only lookup
+            // that won't pollute the cache on miss. Cache errors fall through to
+            // a best-effort direct load;
             // we intentionally don't re-insert there — `fetch_X` errors are almost
             // always the smuggled loader error (so the direct retry will also fail),
             // and on the rare foyer-machinery error an insert would likely fail too.
             let fetch = if cache_blocks {
-                cache
-                    .fetch_filter(
-                        cache_key.clone(),
-                        self.read_loader(handle, CacheTarget::Filters, segment.clone()),
-                    )
-                    .await
-                    .ok()
+                match cache.peek_filter(&cache_key).await {
+                    Ok(Some(entry)) => Some(CacheFetch::hit(entry)),
+                    _ => cache
+                        .fetch_filter(
+                            cache_key.clone(),
+                            self.read_loader(handle, CacheTarget::Filters, segment.clone()),
+                        )
+                        .await
+                        .ok(),
+                }
             } else {
                 cache
                     .get_filter(&cache_key)
@@ -491,14 +496,17 @@ impl TableStore {
         if let Some(cache) = self.cache_for_reads() {
             // See `read_filters` for the rationale on the fall-through path.
             let entry = if cache_blocks {
-                cache
-                    .fetch_stats(
-                        cache_key,
-                        self.read_loader(handle, CacheTarget::Stats, segment.clone()),
-                    )
-                    .await
-                    .ok()
-                    .map(|fetch| fetch.entry)
+                match cache.peek_stats(&cache_key).await {
+                    Ok(Some(entry)) => Some(entry),
+                    _ => cache
+                        .fetch_stats(
+                            cache_key,
+                            self.read_loader(handle, CacheTarget::Stats, segment.clone()),
+                        )
+                        .await
+                        .ok()
+                        .map(|fetch| fetch.entry),
+                }
             } else {
                 cache.get_stats(&cache_key).await.unwrap_or(None)
             };
@@ -548,13 +556,16 @@ impl TableStore {
         if let Some(cache) = self.cache_for_reads() {
             // See `read_filters` for the rationale on the fall-through path.
             let fetch = if cache_blocks {
-                cache
-                    .fetch_index(
-                        cache_key,
-                        self.read_loader(handle, CacheTarget::Index, segment.clone()),
-                    )
-                    .await
-                    .ok()
+                match cache.peek_index(&cache_key).await {
+                    Ok(Some(entry)) => Some(CacheFetch::hit(entry)),
+                    _ => cache
+                        .fetch_index(
+                            cache_key,
+                            self.read_loader(handle, CacheTarget::Index, segment.clone()),
+                        )
+                        .await
+                        .ok(),
+                }
             } else {
                 cache
                     .get_index(&cache_key)
@@ -584,9 +595,9 @@ impl TableStore {
     /// or index). Panics on [`CacheTarget::Data`]: data blocks resolve through
     /// [`Self::block_loader`] because they require a block index lookup.
     ///
-    /// Builds a fresh boxed closure on every call, even when the cache hits and
-    /// the loader is never invoked; revisit if cache-hit allocations show up in
-    /// profiles.
+    /// A loader costs several allocations (the SST info and format clones, the
+    /// object path, the boxed closure), so callers build one only after a
+    /// [`DbCache`] peek misses.
     fn read_loader(
         &self,
         handle: &SsTableHandle,
@@ -644,9 +655,7 @@ impl TableStore {
         })
     }
 
-    /// Builds a fresh boxed closure on every call, even when the cache hits and
-    /// the loader is never invoked; revisit if cache-hit allocations show up in
-    /// profiles.
+    /// Like [`Self::read_loader`], callers build one only after a peek misses.
     fn block_loader(
         &self,
         handle: &SsTableHandle,
@@ -793,8 +802,15 @@ impl TableStore {
                 let block_num = blocks.start;
                 let offset = index.borrow().block_meta().get(block_num).offset();
                 let cache_key: CachedKey = (handle.id, offset).into();
-                let loader = self.block_loader(handle, index.clone(), block_num, segment.clone());
-                if let Ok(fetch) = cache.fetch_block(cache_key, loader).await {
+                let fetch = match cache.peek_block(&cache_key).await {
+                    Ok(Some(entry)) => Ok(CacheFetch::hit(entry)),
+                    _ => {
+                        let loader =
+                            self.block_loader(handle, index.clone(), block_num, segment.clone());
+                        cache.fetch_block(cache_key, loader).await
+                    }
+                };
+                if let Ok(fetch) = fetch {
                     if let Some(block) = fetch.entry.block() {
                         let mut result = VecDeque::with_capacity(1);
                         result.push_back(block);
@@ -1255,7 +1271,9 @@ mod tests {
     use crate::db_cache::test_utils::TestCache;
     use crate::db_cache::CacheTarget;
     use crate::db_cache::SplitCache;
-    use crate::db_cache::{CachedKey, DbCache, DbCacheWrapper};
+    use crate::db_cache::{
+        CacheFetch, CacheLoader, CachedEntry, CachedKey, DbCache, DbCacheWrapper,
+    };
     use crate::db_state::{SsTableHandle, SsTableInfo};
     use crate::error;
     use crate::flatbuffer_types::{
@@ -2157,6 +2175,183 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    /// Counts the `fetch_*` calls that reach the cache. `TableStore` builds one
+    /// loader for each call, so the count is the number of loaders built.
+    struct LoaderCountingCache {
+        inner: TestCache,
+        fetches: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl DbCache for LoaderCountingCache {
+        async fn get_block(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+            self.inner.get_block(key).await
+        }
+        async fn get_index(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+            self.inner.get_index(key).await
+        }
+        async fn get_filter(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+            self.inner.get_filter(key).await
+        }
+        async fn get_stats(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+            self.inner.get_stats(key).await
+        }
+        async fn insert(&self, key: CachedKey, value: CachedEntry) {
+            self.inner.insert(key, value).await
+        }
+        async fn remove(&self, key: &CachedKey) {
+            self.inner.remove(key).await
+        }
+        fn entry_count(&self) -> u64 {
+            self.inner.entry_count()
+        }
+        async fn fetch_block(
+            &self,
+            key: CachedKey,
+            loader: CacheLoader,
+        ) -> Result<CacheFetch, crate::Error> {
+            self.fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.fetch_block(key, loader).await
+        }
+        async fn fetch_index(
+            &self,
+            key: CachedKey,
+            loader: CacheLoader,
+        ) -> Result<CacheFetch, crate::Error> {
+            self.fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.fetch_index(key, loader).await
+        }
+        async fn fetch_filter(
+            &self,
+            key: CachedKey,
+            loader: CacheLoader,
+        ) -> Result<CacheFetch, crate::Error> {
+            self.fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.fetch_filter(key, loader).await
+        }
+        async fn fetch_stats(
+            &self,
+            key: CachedKey,
+            loader: CacheLoader,
+        ) -> Result<CacheFetch, crate::Error> {
+            self.fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.fetch_stats(key, loader).await
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_hits_build_no_loader() {
+        use crate::db_cache::stats::ACCESS_COUNT;
+        use slatedb_common::metrics::{
+            lookup_metric_with_labels, DefaultMetricsRecorder, MetricLevel, MetricsRecorderHelper,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // given: an SST with filters, an index, stats and one data block
+        let main_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let format = SsTableFormat {
+            min_filter_keys: 1,
+            ..SsTableFormat::default()
+        };
+        let writer = TableStore::new(
+            main_store.clone(),
+            format.clone(),
+            Path::from(ROOT),
+            None,
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        );
+        let mut builder = writer.table_builder();
+        builder
+            .add(RowEntry::new_value(b"key1", b"value1", 0))
+            .await
+            .unwrap();
+        builder
+            .add(RowEntry::new_tombstone(b"key2", 0))
+            .await
+            .unwrap();
+        let id = SsTableId::from(ulid::Ulid::new());
+        let handle = writer
+            .write_sst(&id, &builder.build().await.unwrap(), Some(Bytes::new()))
+            .await
+            .unwrap();
+        assert!(handle.info.filter_len > 0 && handle.info.stats_len > 0);
+
+        // given: a reader whose cache counts the loaders it is handed
+        let counting = Arc::new(LoaderCountingCache {
+            inner: TestCache::new(),
+            fetches: AtomicUsize::new(0),
+        });
+        let recorder = Arc::new(DefaultMetricsRecorder::new());
+        let helper = MetricsRecorderHelper::new(recorder.clone(), MetricLevel::default());
+        let wrapper = Arc::new(DbCacheWrapper::new(
+            counting.clone(),
+            &helper,
+            Arc::new(DefaultSystemClock::default()),
+            1,
+        ));
+        let reader = TableStore::new(
+            main_store.clone(),
+            format,
+            Path::from(ROOT),
+            Some(wrapper),
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        );
+        let read_all = || async {
+            let trace = ReadTrace::new(None);
+            let filters = reader
+                .read_filters(&handle, true, Some(Bytes::new()), &trace, None)
+                .await
+                .unwrap();
+            assert!(!filters.is_empty());
+            let index = reader
+                .read_index(&handle, true, Some(Bytes::new()), &trace, None)
+                .await
+                .unwrap();
+            assert!(reader
+                .read_stats(&handle, true, Some(Bytes::new()))
+                .await
+                .unwrap()
+                .is_some());
+            let blocks = reader
+                .read_blocks_using_index(&handle, index, 0..1, true, Some(Bytes::new()))
+                .await
+                .unwrap();
+            assert_eq!(blocks.len(), 1);
+        };
+
+        // when: the first read of each section misses and loads it
+        read_all().await;
+        assert_eq!(counting.fetches.load(Ordering::SeqCst), 4);
+
+        // when: the SST is gone, so only the cache can serve the next reads
+        main_store
+            .put(&reader.path(&id), Bytes::new().into())
+            .await
+            .unwrap();
+        read_all().await;
+        read_all().await;
+
+        // then: the hits built no loader, and each section counts 1 miss and 2 hits
+        assert_eq!(counting.fetches.load(Ordering::SeqCst), 4);
+        for kind in ["filter", "index", "stats", "data_block"] {
+            let count = |result: &str| {
+                lookup_metric_with_labels(
+                    &recorder,
+                    ACCESS_COUNT,
+                    &[("entry_kind", kind), ("result", result)],
+                )
+            };
+            assert_eq!(count("miss"), Some(1), "{kind} misses");
+            assert_eq!(count("hit"), Some(2), "{kind} hits");
+        }
     }
 
     #[tokio::test]
