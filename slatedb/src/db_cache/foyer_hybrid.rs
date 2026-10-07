@@ -149,9 +149,14 @@ impl DbCache for FoyerHybridCache {
         self.inner.remove(key);
     }
 
+    /// The memory tier only; the disk tier is not counted.
     fn entry_count(&self) -> u64 {
-        // foyer cache doesn't support an entry count estimate
-        0
+        self.inner.memory().entries() as u64
+    }
+
+    /// The memory tier only; the disk tier is not counted.
+    fn weighted_size(&self) -> u64 {
+        self.inner.memory().usage() as u64
     }
 
     async fn close(&self) -> Result<(), crate::Error> {

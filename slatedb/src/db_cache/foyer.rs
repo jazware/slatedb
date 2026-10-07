@@ -150,8 +150,11 @@ impl DbCache for FoyerCache {
     }
 
     fn entry_count(&self) -> u64 {
-        // foyer cache doesn't support an entry count estimate
-        0
+        self.inner.entries() as u64
+    }
+
+    fn weighted_size(&self) -> u64 {
+        self.inner.usage() as u64
     }
 
     async fn fetch_block(
@@ -377,6 +380,38 @@ mod tests {
                 assert_eq!(cache.inner.get(&key(0)).is_some(), admit);
             }
         }
+    }
+
+    /// A split cache of two foyer caches reports each one's entries and weighted bytes.
+    #[tokio::test]
+    async fn split_cache_reports_entries_and_weighted_bytes_per_part() {
+        let block_cache = Arc::new(bounded(1 << 20, 1));
+        let meta_cache = Arc::new(bounded(1 << 20, 1));
+        let cache = crate::db_cache::SplitCache::new()
+            .with_block_cache(Some(block_cache.clone()))
+            .with_meta_cache(Some(meta_cache.clone()));
+        assert_eq!(cache.entry_count(), 0);
+        assert_eq!(cache.split_weighted_size(), Some((0, 0)));
+        assert_eq!(block_cache.split_weighted_size(), None);
+
+        let [_, index, filters, _] = entries().await;
+        let meta_bytes = (index.size() + filters.size()) as u64;
+        cache.insert(key(0), block(100)).await;
+        cache.insert(key(1), block(28)).await;
+        cache.insert(key(0), index).await;
+        cache.insert(key(1), filters).await;
+
+        assert_eq!(block_cache.entry_count(), 2);
+        assert_eq!(block_cache.weighted_size(), 128);
+        assert_eq!(meta_cache.entry_count(), 2);
+        assert_eq!(meta_cache.weighted_size(), meta_bytes);
+        assert_eq!(cache.entry_count(), 4);
+        assert_eq!(cache.split_weighted_size(), Some((128, meta_bytes)));
+        assert_eq!(cache.weighted_size(), 128 + meta_bytes);
+
+        cache.remove(&key(0)).await;
+        assert_eq!(cache.entry_count(), 2);
+        assert_eq!(block_cache.weighted_size(), 28);
     }
 
     #[tokio::test]

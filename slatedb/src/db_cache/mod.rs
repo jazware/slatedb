@@ -194,6 +194,19 @@ pub trait DbCache: Send + Sync {
     #[allow(dead_code)]
     fn entry_count(&self) -> u64;
 
+    /// Bytes held in memory as the cache weighs them ([`CachedEntry::size`]),
+    /// for comparing against its capacity. The default reports 0 (unknown).
+    fn weighted_size(&self) -> u64 {
+        0
+    }
+
+    /// For a cache that keeps data blocks apart from metadata (indexes,
+    /// filters, stats), [`Self::weighted_size`] of each as `(block, meta)`.
+    /// The default is `None`: the cache has no such split.
+    fn split_weighted_size(&self) -> Option<(u64, u64)> {
+        None
+    }
+
     /// Gracefully close the cache, flushing any in-memory state to disk.
     ///
     /// Implementations backed by hybrid (memory + disk) caches should use
@@ -678,6 +691,18 @@ impl DbCache for SplitCache {
     fn entry_count(&self) -> u64 {
         self.block_cache.as_ref().map_or(0, |c| c.entry_count())
             + self.meta_cache.as_ref().map_or(0, |c| c.entry_count())
+    }
+
+    fn weighted_size(&self) -> u64 {
+        let (block, meta) = self.split_weighted_size().unwrap_or_default();
+        block + meta
+    }
+
+    fn split_weighted_size(&self) -> Option<(u64, u64)> {
+        Some((
+            self.block_cache.as_ref().map_or(0, |c| c.weighted_size()),
+            self.meta_cache.as_ref().map_or(0, |c| c.weighted_size()),
+        ))
     }
 
     async fn close(&self) -> Result<(), crate::Error> {
