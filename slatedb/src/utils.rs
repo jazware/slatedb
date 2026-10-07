@@ -794,27 +794,22 @@ impl<T> SafeSender<T> {
 
     /// Returns the DB's terminal error for a failed channel send.
     ///
-    /// Panics if the channel is closed before the DB close result is recorded,
-    /// which indicates a lifecycle ordering bug.
-    #[allow(clippy::panic)]
+    /// The channel can close before any close result is recorded: a runtime
+    /// that shuts down drops the receiving task outright, so the task never
+    /// records one. A write from another runtime (or a task the shutdown
+    /// hasn't dropped yet) then gets an error rather than a panic.
     fn closed_send_error(&self, channel_error: String) -> SlateDBError {
-        if let Some(result) = self.closed.read() {
-            match result {
-                Ok(()) => SlateDBError::Closed,
-                Err(err) => err,
-            }
-        } else {
-            panic!(
-                "Failed to send message to unbounded channel: {}",
-                channel_error
-            );
+        match self.closed.read() {
+            Some(Ok(())) => SlateDBError::Closed,
+            Some(Err(err)) => err,
+            None => SlateDBError::BackgroundTaskCancelled(channel_error),
         }
     }
 
     /// Attempts to send a message. If the channel is closed, returns the
-    /// DB's closed result error, or [`SlateDBError::Closed`] if it was a
-    /// clean shutdown. Panics if the channel is closed but no closed result
-    /// has been set (indicates a bug).
+    /// DB's closed result error, [`SlateDBError::Closed`] if it was a clean
+    /// shutdown, or [`SlateDBError::BackgroundTaskCancelled`] if the
+    /// receiving task was dropped without recording one.
     #[inline]
     pub(crate) fn send(&self, message: T) -> Result<(), SlateDBError> {
         match self.tx.try_send(message) {
@@ -1828,5 +1823,19 @@ mod tests {
         assert_eq!(v3, 16384);
         assert_eq!(v4, u32::MAX);
         assert!(slice.is_empty());
+    }
+
+    #[test]
+    fn test_safe_sender_errors_when_receiver_dropped_without_close_result() {
+        let closed = WatchableOnceCell::new();
+        let (tx, rx) = super::SafeSender::<u32>::unbounded_channel(closed.reader());
+        drop(rx);
+        assert!(matches!(
+            tx.send(1),
+            Err(SlateDBError::BackgroundTaskCancelled(_))
+        ));
+
+        closed.write(Ok(()));
+        assert!(matches!(tx.send(2), Err(SlateDBError::Closed)));
     }
 }

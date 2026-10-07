@@ -2407,6 +2407,35 @@ mod tests {
         kv_store.close().await.unwrap();
     }
 
+    /// A runtime shut down under an open DB drops its background tasks
+    /// (their receivers with them) without recording a close result, as a
+    /// process's runtime does on exit or an embedder's does when it stops
+    /// one of several. A write from elsewhere then fails; it must not panic.
+    #[test]
+    fn test_write_after_runtime_shutdown_errors_instead_of_panicking() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let db = db_rt
+            .block_on(
+                Db::builder("/tmp/test_write_after_runtime_shutdown", object_store)
+                    .with_settings(test_db_options(0, 1024, None))
+                    .build(),
+            )
+            .unwrap();
+        db_rt.shutdown_timeout(Duration::from_secs(5));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(db.put(b"k", b"v"));
+        assert!(result.is_err(), "{result:?}");
+    }
+
     #[tokio::test]
     async fn test_manifest_returns_current_versioned_manifest() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
