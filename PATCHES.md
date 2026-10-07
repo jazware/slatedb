@@ -3,7 +3,7 @@
 This fork's `main` is upstream SlateDB `main` at `8c1c6c33` (2026-10-05, "move ownership of next_wal_id to manifest writer (#2142)") plus the patches below, in this order.
 The previous base was upstream 0.17.0 (`c1e36fc`); that stack is still on `8510667e` and on the per-patch branches.
 vlpds and vlRelay pin `main`'s head commit by rev.
-Each patch also has its own branch, so that it can be reported upstream later. The branches still hold the 0.17.0-based commits.
+Each patch also has its own branch, so that it can be reported upstream later. The branches of patches 1 to 6 still hold the 0.17.0-based commits. Patch 7's branch is on the current base.
 Add a row here with every new patch.
 
 | # | Commit | Branch | What and why | Upstream |
@@ -14,6 +14,7 @@ Add a row here with every new patch.
 | 4 | `d82bf1a` | `vlpds-0.17-filtercache` | `CompactionWorkerBuilder::with_db_cache` seeds a standalone worker's output SSTs into the DB cache. Without it, the first reads of a fresh SST always missed its index and filters. | pending report |
 | 5 | dropped (was `c7b29a0`) | `fix/l0-view-merge-dup-sst` | `LsmTreeState::merge_writer_and_compactor` cut L0 at the compacted view id, not the SST id. A union clone has one SST behind several views, and the cut dropped live views, so the next flush failed with `InvalidClockTick`. | superseded by upstream #2134 |
 | 6 | `3984093` | `vlpds-0.17-cache-first-loader` | The table store peeks the cache (new `DbCache::peek_*`) before it builds a `CacheLoader`. Every cache hit built a loader that it did not use, about 10 allocations per section read. | pending report |
+| 7 | `9136da6` | `fix-send-after-close` | `SafeSender::closed_send_error` returns `BackgroundTaskCancelled` when the channel closed with no close result recorded, instead of panicking. A runtime that shuts down drops the DB's background tasks without recording one, so a later write from another runtime panicked ("Failed to send message to unbounded channel"). | pending report |
 
 Patches 2, 4 and 6 were adapted to the new base: their tests call `Db::snapshot` without `.await` (#2138) and pass a `ReadTrace` to `read_blocks_using_index` and `MergeOperatorIterator::new` (read-path tracing, #2096 and #2104). Patch 4 also keeps upstream's new `sst_block_alignment` field next to its own in `CompactionWorkerBuilder`.
 
