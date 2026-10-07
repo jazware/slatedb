@@ -740,7 +740,7 @@ impl DbCache for SplitCache {
         loader: CacheLoader,
     ) -> Result<CacheFetch, crate::Error> {
         if let Some(cache) = &self.block_cache {
-            cache.fetch_block(key, loader).await
+            cache.fetch_block(key, clamping(loader)).await
         } else {
             loader().await.map(CacheFetch::miss)
         }
@@ -752,7 +752,7 @@ impl DbCache for SplitCache {
         loader: CacheLoader,
     ) -> Result<CacheFetch, crate::Error> {
         if let Some(cache) = &self.meta_cache {
-            cache.fetch_index(key, loader).await
+            cache.fetch_index(key, clamping(loader)).await
         } else {
             loader().await.map(CacheFetch::miss)
         }
@@ -781,6 +781,19 @@ impl DbCache for SplitCache {
             loader().await.map(CacheFetch::miss)
         }
     }
+}
+
+/// A loaded block or index usually holds more memory than its length:
+/// uncompressed, it is a `Bytes` slice of the object-store response, which can
+/// be a slice of the HTTP client's whole read buffer; decompressed, it can
+/// keep the decoder's spare capacity. The cache weighs the length, so storing
+/// it unclamped pins memory the cache never counts, as [`SplitCache::insert`]
+/// guards against. Filters and stats decode into owned copies, so their
+/// fetches skip the copy.
+fn clamping(loader: CacheLoader) -> CacheLoader {
+    Box::new(move || {
+        Box::pin(async move { loader().await.map(|entry| entry.clamp_allocated_size()) })
+    })
 }
 
 /// Wraps a [`DbCache`] to add statistics, error logging, and cache scoping.
@@ -1783,6 +1796,83 @@ mod tests {
 
         // then:
         assert_index_clamped(index.as_ref(), cached.sst_index().unwrap().as_ref());
+    }
+
+    fn loader_of(entry: CachedEntry) -> CacheLoader {
+        Box::new(move || Box::pin(async move { Ok(entry) }))
+    }
+
+    fn assert_owns(cached: &bytes::Bytes, parent: &bytes::Bytes) {
+        let start = parent.as_ptr() as usize;
+        let at = cached.as_ptr() as usize;
+        assert!(
+            at < start || at >= start + parent.len(),
+            "cached bytes still point into the loader's buffer"
+        );
+    }
+
+    #[rstest]
+    #[case::test_cache(Arc::new(TestCache::new()), Arc::new(TestCache::new()))]
+    #[cfg_attr(
+        feature = "foyer",
+        case::foyer(Arc::new(FoyerCache::new()), Arc::new(FoyerCache::new()))
+    )]
+    #[tokio::test]
+    async fn test_should_clamp_fetched_entries_to_cache(
+        #[case] block_cache: Arc<dyn DbCache>,
+        #[case] meta_cache: Arc<dyn DbCache>,
+        sst_format: SsTableFormat,
+        #[future(awt)] sst: EncodedSsTable,
+    ) {
+        // given: a block and an index that are slices of the whole SST's bytes
+        let cache = SplitCache::new()
+            .with_block_cache(Some(block_cache))
+            .with_meta_cache(Some(meta_cache))
+            .build();
+        let data = sst.remaining_as_bytes();
+        let block = Arc::new(
+            sst_format
+                .read_block_raw(&sst.info, &sst.index, 0, &data)
+                .await
+                .unwrap(),
+        );
+        let index = sst_format.read_index_raw(&sst.info, &data).await.unwrap();
+        let block_key = CachedKey::from((SST_ID, 1u64));
+        let index_key = CachedKey::from((SST_ID, 2u64));
+
+        // when: both load through the dedup fetch path
+        let fetched_block = cache
+            .fetch_block(
+                block_key.clone(),
+                loader_of(CachedEntry::with_block(block.clone())),
+            )
+            .await
+            .unwrap();
+        let fetched_index = cache
+            .fetch_index(
+                index_key.clone(),
+                loader_of(CachedEntry::with_sst_index(Arc::new(index.clone()))),
+            )
+            .await
+            .unwrap();
+
+        // then: the cache and the caller hold copies, not views of `data`
+        let cached_block = cache.get_block(&block_key).await.unwrap().unwrap();
+        let cached_index = cache.get_index(&index_key).await.unwrap().unwrap();
+        for b in [
+            cached_block.block().unwrap(),
+            fetched_block.entry.block().unwrap(),
+        ] {
+            assert_eq!(b.data, block.data);
+            assert_owns(&b.data, &data);
+        }
+        for i in [
+            cached_index.sst_index().unwrap(),
+            fetched_index.entry.sst_index().unwrap(),
+        ] {
+            assert_index_clamped(&index, i.as_ref());
+            assert_owns(&i.data(), &data);
+        }
     }
 
     #[rstest]
