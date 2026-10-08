@@ -23,8 +23,8 @@ So `git log -- packages/slatedb` in the monorepo shows the fork's whole history,
 The `sync-slatedb` yeet job runs `scripts/slatedb-public/sync.sh`:
 
 1. `export`: the export, twice (the two HEADs must match), and a check that it still contains `87db9e3b`.
-2. `cargo`: `cargo check --workspace --all-targets --all-features`, `cargo nextest run --workspace --all-features --profile ci-cross` and the doc tests, as this repo's CI runs them. The DST and bindings jobs are left to upstream's CI.
-3. `push`: a fast-forward of `main`, after checking that the public `main` is an ancestor of the export. It never force pushes.
+2. `cargo`: `cargo check --workspace --all-targets --all-features`, `cargo nextest run --workspace --all-features --profile ci-cross` and the doc tests, as this repo's CI runs them. The DST and bindings jobs are left to upstream's CI. A run whose export is published already skips them.
+3. `push`: a fast-forward of `main`, after checking that the public `main` is an ancestor of the export. It never force pushes. The push goes to the `slatedb` repo on the monorepo's forge (https://delta.jazco.dev/slatedb), which mirrors `main` here.
 
 By hand, from a git checkout of the monorepo: `DRY_RUN=1 scripts/slatedb-public/sync.sh all` does everything but the push.
 The per-patch branches aren't exported. Push them from a scratch clone of the export when a patch is reported upstream.
