@@ -83,6 +83,8 @@ pub use builder::DbBuilder;
 pub use builder::DbReaderBuilder;
 
 pub(crate) mod builder;
+#[cfg(test)]
+mod open_requests;
 
 pub(crate) struct DbInner {
     pub(crate) state: Arc<RwLock<DbState>>,

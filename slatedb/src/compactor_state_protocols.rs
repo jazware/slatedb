@@ -135,10 +135,8 @@ impl CompactorStateWriter {
         options: &CompactorOptions,
         rand: Arc<DbRand>,
     ) -> Result<Self, SlateDBError> {
-        let stored_manifest =
-            StoredManifest::load(manifest_store.clone(), system_clock.clone()).await?;
         let (manifest, mut compactions) = Self::fence(
-            stored_manifest,
+            manifest_store,
             compactions_store,
             system_clock.clone(),
             options,
@@ -147,6 +145,7 @@ impl CompactorStateWriter {
         let dirty_manifest = manifest.prepare_dirty()?;
         let dirty_compactions = loop {
             let mut dirty_compactions = compactions.prepare_dirty()?;
+            let fenced = dirty_compactions.value.clone();
             // Reset unclaimed scheduled compactions back to submitted on restart.
             // Scheduled compactions have no worker yet, so they always reset.
             // Stale Running compactions are left alone here: reclaim_stale_workers
@@ -159,6 +158,9 @@ impl CompactorStateWriter {
                 }
             });
             dirty_compactions.value.retain_active_and_last_finished();
+            if dirty_compactions.value == fenced {
+                break dirty_compactions;
+            }
             match compactions.update(dirty_compactions.clone()).await {
                 Ok(()) => break dirty_compactions,
                 Err(err) if err.is_sequenced_write_conflict() => {
@@ -178,25 +180,35 @@ impl CompactorStateWriter {
     }
 
     async fn fence(
-        stored_manifest: StoredManifest,
+        manifest_store: Arc<ManifestStore>,
         compactions_store: Arc<CompactionsStore>,
         system_clock: Arc<dyn SystemClock>,
         options: &CompactorOptions,
     ) -> Result<(FenceableManifest, FenceableCompactions), SlateDBError> {
-        let fenceable_manifest = FenceableManifest::init_compactor(
-            stored_manifest,
-            options.manifest_update_timeout,
-            system_clock.clone(),
-        )
-        .await?;
-        let stored_compactions =
+        // The compactions file is read alongside the manifest fence rather than
+        // after it: if another compactor writes it in between, the epoch write
+        // below conflicts, refreshes, and is fenced as it would be anyway.
+        let fence_manifest = async {
+            let stored_manifest =
+                StoredManifest::load(manifest_store, system_clock.clone()).await?;
+            FenceableManifest::init_compactor(
+                stored_manifest,
+                options.manifest_update_timeout,
+                system_clock.clone(),
+            )
+            .await
+        };
+        let load_compactions = async {
             match StoredCompactions::try_load(compactions_store.clone()).await? {
-                Some(compactions) => compactions,
+                Some(compactions) => Ok(compactions),
                 None => {
                     info!("creating new compactions file [compactor_epoch=0]");
-                    StoredCompactions::create(compactions_store.clone(), 0).await?
+                    StoredCompactions::create(compactions_store.clone(), 0).await
                 }
-            };
+            }
+        };
+        let (fenceable_manifest, stored_compactions) =
+            futures::future::try_join(fence_manifest, load_compactions).await?;
         let fenceable_compactions = FenceableCompactions::init_with_epoch(
             stored_compactions,
             options.manifest_update_timeout,

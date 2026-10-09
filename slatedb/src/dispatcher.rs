@@ -280,6 +280,11 @@ impl<T: Send + std::fmt::Debug> MessageDispatcher<T> {
     /// A [Result] containing `Ok(())` on clean shutdown, or an error if the handler
     /// fails for any reason.
     async fn run(&mut self) -> Result<(), SlateDBError> {
+        tokio::select! {
+            biased;
+            _ = self.cancellation_token.cancelled() => return Ok(()),
+            result = self.handler.init() => result?,
+        }
         let mut tickers = self
             .handler
             .tickers()
@@ -458,6 +463,16 @@ impl<'a, T: Send> MessageDispatcherTicker<'a, T> {
 /// [MessageHandlerExecutor] will handle them appropriately.
 #[async_trait]
 pub(crate) trait MessageHandler<T: Send>: Send {
+    /// Runs once in the handler's own task, before [`tickers`](Self::tickers),
+    /// [`notifiers`](Self::notifiers) and the first message. A handler whose
+    /// set-up does I/O does it here, so the code that registers it doesn't wait.
+    /// An error ends the task like an error from [`handle`](Self::handle). If
+    /// the task is cancelled first, the dispatcher skips the loop and goes
+    /// straight to [`cleanup`](Self::cleanup).
+    async fn init(&mut self) -> Result<(), SlateDBError> {
+        Ok(())
+    }
+
     /// Defines message ticker schedules. [MessageDispatcher::run] instantiates a
     /// [MessageDispatcherTicker] for each ticker defined here. Whenever each ticker
     /// ticks, the message factory generates a message, and [MessageDispatcher] sends the
@@ -518,6 +533,71 @@ pub(crate) trait MessageHandler<T: Send>: Send {
         messages: BoxStream<'async_trait, T>,
         result: Result<(), SlateDBError>,
     ) -> Result<(), SlateDBError>;
+}
+
+pub(crate) type HandlerFuture<T> =
+    BoxFuture<'static, Result<Box<dyn MessageHandler<T>>, SlateDBError>>;
+
+/// Builds its handler in [`MessageHandler::init`], from a future given at
+/// registration, so a handler that does I/O to start (the compactor fences the
+/// manifest and the compactions file) starts after the caller has moved on.
+pub(crate) struct DeferredHandler<T: Send> {
+    build: Option<HandlerFuture<T>>,
+    handler: Option<Box<dyn MessageHandler<T>>>,
+}
+
+impl<T: Send> DeferredHandler<T> {
+    pub(crate) fn new(build: HandlerFuture<T>) -> Self {
+        Self {
+            build: Some(build),
+            handler: None,
+        }
+    }
+
+    fn handler(&mut self) -> Result<&mut Box<dyn MessageHandler<T>>, SlateDBError> {
+        self.handler.as_mut().ok_or(SlateDBError::InvalidDBState)
+    }
+}
+
+#[async_trait]
+impl<T: Send + 'static> MessageHandler<T> for DeferredHandler<T> {
+    async fn init(&mut self) -> Result<(), SlateDBError> {
+        if let Some(build) = self.build.take() {
+            let mut handler = build.await?;
+            handler.init().await?;
+            self.handler = Some(handler);
+        }
+        Ok(())
+    }
+
+    fn tickers(&mut self) -> Vec<MessageTickerDef<T>> {
+        self.handler
+            .as_mut()
+            .map(|h| h.tickers())
+            .unwrap_or_default()
+    }
+
+    fn notifiers(&mut self) -> Vec<Box<dyn Notifier<T>>> {
+        self.handler
+            .as_mut()
+            .map(|h| h.notifiers())
+            .unwrap_or_default()
+    }
+
+    async fn handle(&mut self, message: T) -> Result<(), SlateDBError> {
+        self.handler()?.handle(message).await
+    }
+
+    async fn cleanup(
+        &mut self,
+        messages: BoxStream<'async_trait, T>,
+        result: Result<(), SlateDBError>,
+    ) -> Result<(), SlateDBError> {
+        match self.handler.as_mut() {
+            Some(handler) => handler.cleanup(messages, result).await,
+            None => Ok(()),
+        }
+    }
 }
 
 /// A builder data structure for [MessageHandlerExecutor]. The executor creates a

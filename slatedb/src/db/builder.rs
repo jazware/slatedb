@@ -142,7 +142,7 @@ use crate::db_cache::SplitCache;
 use crate::db_cache::{DbCache, DbCacheAndScope, DbCacheWrapper, UnownedDbCache};
 use crate::db_reader::{DbReader, DbReaderMode};
 use crate::db_status::{ClosedResultWriter, DbStatusManager};
-use crate::dispatcher::MessageHandlerExecutor;
+use crate::dispatcher::{DeferredHandler, MessageHandler, MessageHandlerExecutor};
 use crate::error::SlateDBError;
 use crate::fence::{WriterFenceResult, WriterFencer};
 use crate::filter_policy::{BloomFilterPolicy, FilterPolicy};
@@ -807,13 +807,11 @@ impl<P: Into<Path>> DbBuilder<P> {
                 TableStoreKind::Compactor,
                 self.block_cache_policy.clone(),
             ));
-            let compactor_handlers = builder
-                .build_handler(
-                    compactor_table_store,
-                    manifest_store.clone(),
-                    compactions_store.clone(),
-                )
-                .await?;
+            let compactor_handlers = builder.build_handler(
+                compactor_table_store,
+                manifest_store.clone(),
+                compactions_store.clone(),
+            )?;
             task_executor.add_handler(
                 COMPACTOR_TASK_NAME.to_string(),
                 Box::new(compactor_handlers.handler),
@@ -1232,8 +1230,9 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
 /// [`CompactorBuilder::build_handler`]. Each handler and its receiver must be registered
 /// with the task executor in `DbBuilder::build`.
 pub(crate) struct CompactorHandlers {
-    /// The coordinator event handler.
-    pub(crate) handler: CompactorEventHandler,
+    /// The coordinator event handler. It fences the manifest and the
+    /// compactions file in its task, so `DbBuilder::build` doesn't wait on it.
+    pub(crate) handler: DeferredHandler<CompactorMessage>,
     /// Receiver for the coordinator's messages.
     pub(crate) rx: async_channel::Receiver<CompactorMessage>,
     /// The embedded worker handler and its receiver, present when
@@ -1496,7 +1495,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
     /// The embedded worker handler is present when [`CompactorOptions::worker`] is `Some`.
     /// Each handler and its receiver must be registered with the task executor in
     /// DbBuilder::build.
-    pub(crate) async fn build_handler(
+    pub(crate) fn build_handler(
         self,
         table_store: Arc<TableStore>,
         manifest_store: Arc<ManifestStore>,
@@ -1513,17 +1512,31 @@ impl<P: Into<Path>> CompactorBuilder<P> {
         let (_tx, rx) = async_channel::unbounded();
         let scheduler = Arc::from(scheduler_supplier.compaction_scheduler(&options));
         let stats = Arc::new(CompactionStats::new(&recorder));
-        let handler = CompactorEventHandler::new(
-            manifest_store.clone(),
-            compactions_store.clone(),
-            options.clone(),
-            scheduler,
-            self.rand.clone(),
-            stats.clone(),
-            self.system_clock.clone(),
-            recorder.clone(),
-        )
-        .await?;
+        let handler = DeferredHandler::new({
+            let (manifest_store, compactions_store, options, rand, stats, clock, recorder) = (
+                manifest_store.clone(),
+                compactions_store.clone(),
+                options.clone(),
+                self.rand.clone(),
+                stats.clone(),
+                self.system_clock.clone(),
+                recorder.clone(),
+            );
+            Box::pin(async move {
+                let handler = CompactorEventHandler::new(
+                    manifest_store,
+                    compactions_store,
+                    options,
+                    scheduler,
+                    rand,
+                    stats,
+                    clock,
+                    recorder,
+                )
+                .await?;
+                Ok(Box::new(handler) as Box<dyn MessageHandler<CompactorMessage>>)
+            })
+        });
         let worker = options.worker.clone().map(|worker_options| {
             CompactionWorkerHandler::build_worker_handler(
                 manifest_store,
