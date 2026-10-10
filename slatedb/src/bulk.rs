@@ -9,6 +9,7 @@
 //! sequence number. The result opens with [`crate::Db::builder`] like any
 //! other database.
 
+use crate::config::Settings;
 use crate::db_state::{SortedRun, SsTableHandle, SsTableId, SsTableView};
 use crate::error::SlateDBError;
 use crate::format::sst::SsTableFormat;
@@ -16,11 +17,12 @@ use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::manifest::{LsmTreeState, ManifestCore};
 use crate::tablestore::{EncodedSsTableWriter, TableStore, TableStoreKind};
 use crate::types::{RowEntry, ValueDeletable};
-use crate::config::Settings;
+use crate::utils::IdGenerator;
 use bytes::Bytes;
 use object_store::path::Path;
 use object_store::ObjectStore;
 use slatedb_common::clock::{DefaultSystemClock, SystemClock};
+use slatedb_common::DbRand;
 use std::sync::Arc;
 
 /// What [`SortedRunWriter::finish`] wrote.
@@ -44,6 +46,8 @@ pub struct SortedRunWriter {
     ssts: Vec<SsTableHandle>,
     last_key: Option<Bytes>,
     stats: SortedRunStats,
+    rand: Arc<DbRand>,
+    clock: Arc<dyn SystemClock>,
 }
 
 /// Rows get this sequence number; the manifest's `last_l0_seq` covers it, so
@@ -84,6 +88,8 @@ impl SortedRunWriter {
             ssts: Vec::new(),
             last_key: None,
             stats: SortedRunStats::default(),
+            rand: Arc::new(DbRand::default()),
+            clock: Arc::new(DefaultSystemClock::new()),
         }
     }
 
@@ -91,21 +97,27 @@ impl SortedRunWriter {
     pub async fn add(&mut self, key: &[u8], value: &[u8]) -> Result<(), crate::Error> {
         if let Some(last) = &self.last_key {
             if key <= last.as_ref() {
-                return Err(crate::Error::invalid("SortedRunWriter keys must be strictly ascending".to_string()));
+                return Err(crate::Error::invalid(
+                    "SortedRunWriter keys must be strictly ascending".to_string(),
+                ));
             }
         }
         self.last_key = Some(Bytes::copy_from_slice(key));
         if self.writer.is_none() {
-            self.writer = Some(self.table_store.table_writer(SsTableId::from(ulid::Ulid::new()), None));
+            let id = self.rand.rng().gen_ulid(self.clock.as_ref());
+            self.writer = Some(self.table_store.table_writer(SsTableId::from(id), None));
         }
         let w = self.writer.as_mut().expect("writer");
-        if let Some(n) = w.add(RowEntry::new(
-            Bytes::copy_from_slice(key),
-            ValueDeletable::Value(Bytes::copy_from_slice(value)),
-            BULK_SEQ,
-            None,
-            None,
-        )).await? {
+        if let Some(n) = w
+            .add(RowEntry::new(
+                Bytes::copy_from_slice(key),
+                ValueDeletable::Value(Bytes::copy_from_slice(value)),
+                BULK_SEQ,
+                None,
+                None,
+            ))
+            .await?
+        {
             self.sst_bytes += n;
         }
         self.stats.rows += 1;
@@ -134,9 +146,12 @@ impl SortedRunWriter {
         self.stats.ssts = self.ssts.len();
         let run = SortedRun::new(0, self.ssts.into_iter().map(SsTableView::identity));
         let mut core = ManifestCore::new();
-        core.tree = Arc::new(LsmTreeState { compacted: vec![run], ..LsmTreeState::default() });
+        core.tree = Arc::new(LsmTreeState {
+            compacted: vec![run],
+            ..LsmTreeState::default()
+        });
         core.last_l0_seq = BULK_SEQ;
-        let clock: Arc<dyn SystemClock> = Arc::new(DefaultSystemClock::new());
+        let clock = self.clock.clone();
         let store = Arc::new(ManifestStore::new(&self.path, self.object_store.clone()));
         StoredManifest::create_new_db(store, core, clock).await?;
         Ok(self.stats)
@@ -154,22 +169,38 @@ mod tests {
         let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let mut w = SortedRunWriter::new("db", os.clone(), &Settings::default(), 64 << 10);
         for i in 0..20_000u32 {
-            w.add(&i.to_be_bytes(), format!("v{i}").as_bytes()).await.unwrap();
+            w.add(&i.to_be_bytes(), format!("v{i}").as_bytes())
+                .await
+                .unwrap();
         }
-        assert!(w.add(&5u32.to_be_bytes(), b"x").await.is_err(), "keys must ascend");
+        assert!(
+            w.add(&5u32.to_be_bytes(), b"x").await.is_err(),
+            "keys must ascend"
+        );
         let mut w = SortedRunWriter::new("db", os.clone(), &Settings::default(), 64 << 10);
         for i in 0..20_000u32 {
-            w.add(&i.to_be_bytes(), format!("v{i}").as_bytes()).await.unwrap();
+            w.add(&i.to_be_bytes(), format!("v{i}").as_bytes())
+                .await
+                .unwrap();
         }
         let st = w.finish().await.unwrap();
         assert_eq!(st.rows, 20_000);
         assert!(st.ssts > 1, "cut into several SSTs: {st:?}");
 
         let db = Db::builder("db", os.clone()).build().await.unwrap();
-        assert_eq!(db.get(7u32.to_be_bytes()).await.unwrap().as_deref(), Some(&b"v7"[..]));
-        assert_eq!(db.get(19_999u32.to_be_bytes()).await.unwrap().as_deref(), Some(&b"v19999"[..]));
+        assert_eq!(
+            db.get(7u32.to_be_bytes()).await.unwrap().as_deref(),
+            Some(&b"v7"[..])
+        );
+        assert_eq!(
+            db.get(19_999u32.to_be_bytes()).await.unwrap().as_deref(),
+            Some(&b"v19999"[..])
+        );
         assert_eq!(db.get(20_000u32.to_be_bytes()).await.unwrap(), None);
-        let mut it = db.scan(100u32.to_be_bytes()..110u32.to_be_bytes()).await.unwrap();
+        let mut it = db
+            .scan(100u32.to_be_bytes()..110u32.to_be_bytes())
+            .await
+            .unwrap();
         let mut n = 0;
         while let Some(kv) = it.next().await.unwrap() {
             assert_eq!(kv.value.as_ref(), format!("v{}", 100 + n).as_bytes());
@@ -180,14 +211,23 @@ mod tests {
         db.put(7u32.to_be_bytes(), b"new").await.unwrap();
         db.delete(8u32.to_be_bytes()).await.unwrap();
         db.flush().await.unwrap();
-        assert_eq!(db.get(7u32.to_be_bytes()).await.unwrap().as_deref(), Some(&b"new"[..]));
+        assert_eq!(
+            db.get(7u32.to_be_bytes()).await.unwrap().as_deref(),
+            Some(&b"new"[..])
+        );
         assert_eq!(db.get(8u32.to_be_bytes()).await.unwrap(), None);
         db.close().await.unwrap();
 
         // and survive a reopen
         let db = Db::builder("db", os.clone()).build().await.unwrap();
-        assert_eq!(db.get(7u32.to_be_bytes()).await.unwrap().as_deref(), Some(&b"new"[..]));
-        assert_eq!(db.get(9u32.to_be_bytes()).await.unwrap().as_deref(), Some(&b"v9"[..]));
+        assert_eq!(
+            db.get(7u32.to_be_bytes()).await.unwrap().as_deref(),
+            Some(&b"new"[..])
+        );
+        assert_eq!(
+            db.get(9u32.to_be_bytes()).await.unwrap().as_deref(),
+            Some(&b"v9"[..])
+        );
         db.close().await.unwrap();
 
         // a second build over an existing database fails
