@@ -82,6 +82,7 @@ pub use wal::slatedb::writer::stats as wal_buffer_stats;
 pub use wal_reader::{WalFile, WalFileIterator, WalReader};
 
 pub mod admin;
+pub mod bulk;
 pub mod cached_object_store;
 pub mod clock;
 #[cfg(feature = "bencher")]
