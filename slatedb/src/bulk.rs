@@ -230,6 +230,16 @@ mod tests {
         );
         db.close().await.unwrap();
 
+        // no rows: a database with an empty run, which opens and takes writes
+        let w = SortedRunWriter::new("empty", os.clone(), &Settings::default(), 64 << 10);
+        let st = w.finish().await.unwrap();
+        assert_eq!((st.rows, st.ssts), (0, 0));
+        let db = Db::builder("empty", os.clone()).build().await.unwrap();
+        assert_eq!(db.get(b"a").await.unwrap(), None);
+        db.put(b"a", b"b").await.unwrap();
+        assert_eq!(db.get(b"a").await.unwrap().as_deref(), Some(&b"b"[..]));
+        db.close().await.unwrap();
+
         // a second build over an existing database fails
         let mut w = SortedRunWriter::new("db", os.clone(), &Settings::default(), 64 << 10);
         w.add(b"a", b"b").await.unwrap();
