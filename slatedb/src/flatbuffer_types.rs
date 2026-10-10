@@ -90,6 +90,13 @@ impl SsTableIndexOwned {
         Ok(Self { data })
     }
 
+    /// Without the verifier: for bytes whose checksum matched in a database
+    /// opened with `DbBuilder::with_trusted_sst_index`, or bytes copied from
+    /// an index that was already verified.
+    pub(crate) fn new_trusted(data: Bytes) -> Self {
+        Self { data }
+    }
+
     pub(crate) fn borrow(&self) -> SsTableIndex<'_> {
         let raw = &self.data;
         unsafe { flatbuffers::root_unchecked::<SsTableIndex>(raw) }
@@ -99,9 +106,10 @@ impl SsTableIndexOwned {
         self.data.clone()
     }
 
+    /// A copy of these bytes, already verified (or trusted) when `self` was
+    /// made, so the copy isn't verified again.
     pub(crate) fn clamp_allocated_size(&self) -> Self {
-        Self::new(clamp_allocated_size_bytes(&self.data))
-            .expect("clamped buffer could not be decoded to index")
+        Self::new_trusted(clamp_allocated_size_bytes(&self.data))
     }
 
     /// Returns the size of the SSTable index in bytes.

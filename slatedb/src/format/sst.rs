@@ -705,6 +705,8 @@ pub(crate) struct SsTableFormat {
     pub(crate) compression_codec: Option<CompressionCodec>,
     pub(crate) block_transformer: Option<Arc<dyn BlockTransformer>>,
     pub(crate) block_format: Option<crate::sst_builder::BlockFormat>,
+    /// Skip the flatbuffer verifier on indexes whose checksum matched.
+    pub(crate) trusted_index: bool,
 }
 
 impl Default for SsTableFormat {
@@ -718,6 +720,7 @@ impl Default for SsTableFormat {
             compression_codec: None,
             block_transformer: None,
             block_format: None,
+            trusted_index: false,
         }
     }
 }
@@ -920,6 +923,9 @@ impl SsTableFormat {
             None => untransformed_bytes,
         };
 
+        if self.trusted_index {
+            return Ok(SsTableIndexOwned::new_trusted(decompressed_bytes));
+        }
         Ok(SsTableIndexOwned::new(decompressed_bytes)?)
     }
 
@@ -1305,6 +1311,24 @@ fn fetched_index(offset: u64, fetched_start: u64) -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// A trusted index still has to pass its checksum: only the verifier is skipped.
+    #[tokio::test]
+    async fn trusted_index_still_checks_the_checksum() {
+        let format = SsTableFormat {
+            trusted_index: true,
+            ..SsTableFormat::default()
+        };
+        let mut b = bytes::BytesMut::from(&b"not an index"[..]);
+        b.extend_from_slice(&(crc32fast::hash(b"not an index") ^ 1).to_be_bytes());
+        let Err(err) = format.decode_index(b.freeze(), None).await else {
+            panic!("decoded")
+        };
+        assert!(
+            matches!(err, SlateDBError::ChecksumMismatch { .. }),
+            "{err:?}"
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -12,6 +12,7 @@
 use crate::config::Settings;
 use crate::db_state::{SortedRun, SsTableHandle, SsTableId, SsTableView};
 use crate::error::SlateDBError;
+use crate::filter_policy::FilterPolicy;
 use crate::format::sst::SsTableFormat;
 use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::manifest::{LsmTreeState, ManifestCore};
@@ -48,6 +49,7 @@ pub struct SortedRunWriter {
     stats: SortedRunStats,
     rand: Arc<DbRand>,
     clock: Arc<dyn SystemClock>,
+    sst_format: SsTableFormat,
 }
 
 /// Rows get this sequence number; the manifest's `last_l0_seq` covers it, so
@@ -70,14 +72,7 @@ impl SortedRunWriter {
             compression_codec: settings.compression_codec,
             ..SsTableFormat::default()
         };
-        let table_store = Arc::new(TableStore::new(
-            object_store.clone(),
-            sst_format,
-            path.clone(),
-            None,
-            TableStoreKind::Main,
-            Default::default(),
-        ));
+        let table_store = Self::table_store(&object_store, &path, &sst_format);
         Self {
             path,
             object_store,
@@ -90,7 +85,39 @@ impl SortedRunWriter {
             stats: SortedRunStats::default(),
             rand: Arc::new(DbRand::default()),
             clock: Arc::new(DefaultSystemClock::new()),
+            sst_format,
         }
+    }
+
+    fn table_store(
+        object_store: &Arc<dyn ObjectStore>,
+        path: &Path,
+        format: &SsTableFormat,
+    ) -> Arc<TableStore> {
+        Arc::new(TableStore::new(
+            object_store.clone(),
+            format.clone(),
+            path.clone(),
+            None,
+            TableStoreKind::Main,
+            Default::default(),
+        ))
+    }
+
+    /// Data block size, as `DbBuilder::with_sst_block_size` sets it for the
+    /// database that will read these SSTs. Call before the first `add`.
+    pub fn with_block_size(mut self, block_size: crate::config::SstBlockSize) -> Self {
+        self.sst_format.block_size = block_size.as_bytes();
+        self.table_store = Self::table_store(&self.object_store, &self.path, &self.sst_format);
+        self
+    }
+
+    /// Filter policies, as `DbBuilder::with_filter_policies` sets them; an
+    /// empty list writes no filters. Call before the first `add`.
+    pub fn with_filter_policies(mut self, policies: Vec<Arc<dyn FilterPolicy>>) -> Self {
+        self.sst_format.filter_policies = policies;
+        self.table_store = Self::table_store(&self.object_store, &self.path, &self.sst_format);
+        self
     }
 
     /// Adds a row. Keys must be strictly ascending.
@@ -238,6 +265,30 @@ mod tests {
         assert_eq!(db.get(b"a").await.unwrap(), None);
         db.put(b"a", b"b").await.unwrap();
         assert_eq!(db.get(b"a").await.unwrap().as_deref(), Some(&b"b"[..]));
+        db.close().await.unwrap();
+
+        // 64 KiB blocks and no filters: read back by a database built the same way
+        let mut w = SortedRunWriter::new("big", os.clone(), &Settings::default(), 64 << 10)
+            .with_block_size(crate::config::SstBlockSize::Block64Kib)
+            .with_filter_policies(vec![]);
+        for i in 0..20_000u32 {
+            w.add(&i.to_be_bytes(), format!("v{i}").as_bytes())
+                .await
+                .unwrap();
+        }
+        w.finish().await.unwrap();
+        let db = Db::builder("big", os.clone())
+            .with_sst_block_size(crate::config::SstBlockSize::Block64Kib)
+            .with_filter_policies(vec![])
+            .with_trusted_sst_index(true)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get(12_345u32.to_be_bytes()).await.unwrap().as_deref(),
+            Some(&b"v12345"[..])
+        );
+        assert_eq!(db.get(20_001u32.to_be_bytes()).await.unwrap(), None);
         db.close().await.unwrap();
 
         // a second build over an existing database fails

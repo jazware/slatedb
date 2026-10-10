@@ -193,6 +193,7 @@ pub struct DbBuilder<P: Into<Path>> {
     seed: Option<u64>,
     sst_block_size: Option<SstBlockSize>,
     sst_block_alignment: bool,
+    trusted_sst_index: bool,
     merge_operator: Option<MergeOperatorType>,
     block_transformer: Option<Arc<dyn BlockTransformer>>,
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
@@ -225,6 +226,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             seed: None,
             sst_block_size: None,
             sst_block_alignment: false,
+            trusted_sst_index: false,
             merge_operator: None,
             block_transformer: None,
             filter_policies: default_filter_policies(),
@@ -429,6 +431,19 @@ impl<P: Into<Path>> DbBuilder<P> {
         self
     }
 
+    /// Reads SST indexes without the flatbuffer verifier once their
+    /// checksum matches. Only for databases whose SSTs this deployment
+    /// wrote itself: the checksum still catches corruption, but bytes that
+    /// pass it and aren't a valid index (a writer bug, a foreign file) would
+    /// be read unchecked. Verifying an index costs more than reading it
+    /// (a few MB per 256 MB SST at 4 KiB blocks).
+    ///
+    /// Defaults to `false`.
+    pub fn with_trusted_sst_index(mut self, trusted: bool) -> Self {
+        self.trusted_sst_index = trusted;
+        self
+    }
+
     /// Sets the merge operator to use for the database. The merge operator allows
     /// applications to bypass the traditional read/modify/write cycle by expressing
     /// partial updates using an associative operator.
@@ -587,6 +602,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             block_alignment: self.sst_block_alignment,
             block_transformer: self.block_transformer.clone(),
             block_format,
+            trusted_index: self.trusted_sst_index,
             ..SsTableFormat::default()
         };
 
